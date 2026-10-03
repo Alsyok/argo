@@ -86,7 +86,7 @@ supervisor="supervise-daemon"
 command="/etc/vps-tunnel/run"
 respawn_delay=5
 respawn_max=0
-respawn_period=0
+respawn_period=60
 output_log="/var/log/vps-tunnel-service.log"
 error_log="/var/log/vps-tunnel-service.log"
 depend() { need net; after firewall; }
