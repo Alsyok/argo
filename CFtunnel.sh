@@ -619,20 +619,37 @@ node_logs() {
 }
 locate_country() {
     country_flag=🌐; country_name=未知
-    # Geolocation of this VPS's egress IP; failure never blocks node installation.
-    geo=$(curl -fsS --connect-timeout 2 --max-time 4 https://ipapi.co/json/ 2>/dev/null || true)
-    code=$(printf '%s' "$geo" | jq -er '.country_code // empty' 2>/dev/null || true)
-    if printf '%s' "$code" | grep -Eq '^[A-Z]{2}$'; then
-        country_flag=$(jq -nr --arg c "$code" '$c|explode|map(.+127397)|implode')
-        country_name=$(printf '%s' "$geo" | jq -r '.country_name // "未知"')
-        (umask 077; printf '%s\n' "$code" > "$NBASE/country-code"; printf '%s\n' "$country_name" > "$NBASE/country-name")
-    elif [ -s "$NBASE/country-code" ]; then
-        code=$(cat "$NBASE/country-code")
-        if printf '%s' "$code" | grep -Eq '^[A-Z]{2}$'; then
-            country_flag=$(jq -nr --arg c "$code" '$c|explode|map(.+127397)|implode')
-            country_name=$(cat "$NBASE/country-name" 2>/dev/null || printf 未知)
+    # Query this VPS directly, with bounded retries across providers and IP families.
+    code=; geo=
+    for family in -4 -6; do
+        for endpoint in https://ipapi.co/json/ https://api.ip.sb/geoip https://ipwho.is/; do
+            geo=$(curl "$family" --noproxy '*' -fsS --connect-timeout 2 --max-time 4 "$endpoint" 2>/dev/null || true)
+            code=$(printf '%s' "$geo" | jq -er '
+                select(type == "object" and .success != false and .error != true)
+                | .country_code | select(type == "string") | ascii_upcase
+                | select(test("^[A-Z]{2}$") and . != "XX" and . != "ZZ")
+            ' 2>/dev/null || true)
+            [ -n "$code" ] && break
+        done
+        [ -n "$code" ] && break
+    done
+    if [ -n "$code" ]; then
+        country_name=$(printf '%s' "$geo" | jq -r '
+            (.country_name // .country // empty)
+            | select(type == "string" and length > 0)
+        ' 2>/dev/null || true)
+        [ -n "$country_name" ] || country_name=$code
+        # A failed cache write must not interrupt node installation or querying.
+        (umask 077; mkdir -p "$NBASE" && printf '%s\n' "$code" > "$NBASE/country-code" && printf '%s\n' "$country_name" > "$NBASE/country-name") 2>/dev/null || true
+    else
+        code=$(cat "$NBASE/country-code" 2>/dev/null || true)
+        if ! printf '%s' "$code" | grep -Eq '^[A-Z]{2}$'; then
+            return 0
         fi
+        country_name=$(cat "$NBASE/country-name" 2>/dev/null || true)
+        [ -n "$country_name" ] || country_name=$code
     fi
+    country_flag=$(jq -nr --arg c "$code" '$c|explode|map(.+127397)|implode' 2>/dev/null || printf '🌐')
 }
 connection_report() {
     printf '\n'; rule
