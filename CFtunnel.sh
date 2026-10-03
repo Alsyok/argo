@@ -7,10 +7,21 @@ BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
 LOG=/var/log/vps-tunnel/cloudflared.log
 TMP=
+C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
+if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RESET=$(printf '\033[0m')
+    C_CYAN=$(printf '\033[1;36m')
+    C_GREEN=$(printf '\033[1;32m')
+    C_YELLOW=$(printf '\033[1;33m')
+    C_RED=$(printf '\033[1;31m')
+    C_DIM=$(printf '\033[90m')
+    C_WHITE=$(printf '\033[1;37m')
+fi
 cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap cleanup EXIT
-die() { printf '错误：%s\n' "$*" >&2; exit 1; }
-ask() { printf '%s' "$1" >&2; IFS= read -r REPLY || exit 0; }
+die() { printf '%s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+ask() { printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
+menu_item() { printf '  %s%s%s  %s\n' "$1" "$2" "$C_RESET" "$3"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
     [ -f /etc/os-release ] || die '无法识别系统。'
@@ -119,16 +130,27 @@ setup() {
     mode=$1
     confirm_replace || return 0
     if [ "$mode" = quick ]; then
-        ask '请输入本地 HTTP / WebSocket 服务端口 [8080]：'
-        port=${REPLY:-8080}
-        case "$port" in ''|*[!0-9]*|??????*) die '端口必须是 1–65535。';; esac
-        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die '端口必须是 1–65535。'
-        port=$(printf '%s' "$port" | sed 's/^0*//')
+        while :; do
+            ask '请输入本地 HTTP / WebSocket 服务端口 [8080]：'
+            port=${REPLY:-8080}
+            case "$port" in
+                *[!0-9]*|??????*) printf '端口必须是 1–65535，请重新输入。\n'; continue;;
+            esac
+            port=$(printf '%s' "$port" | sed 's/^0*//')
+            port=${port:-0}
+            if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then break; fi
+            printf '端口必须是 1–65535，请重新输入。\n'
+        done
     else
         printf '请先在 Cloudflare 后台创建隧道，配置域名和本地服务地址。\n'
-        ask '粘贴 Tunnel Token（只粘贴 Token，不要整条命令）：'
-        token=$REPLY
-        case "$token" in ''|*[!A-Za-z0-9_+/=-]*) die 'Token 为空或包含不允许的字符。';; esac
+        while :; do
+            ask '粘贴 Tunnel Token（只粘贴 Token，不要整条命令）：'
+            token=$REPLY
+            case "$token" in
+                ''|*[!A-Za-z0-9_+/=-]*) printf 'Token 为空或包含不允许的字符，请重新输入。\n';;
+                *) break;;
+            esac
+        done
     fi
     [ -x "$BIN" ] || download
     if exists; then stop_if_running; fi
@@ -202,9 +224,28 @@ uninstall() {
 main() {
     detect
     while :; do
-        printf '\nCloudflare 隧道管理 v%s | %s / %s\n' "$VERSION" "$ID" "$MANAGER"
-        printf '1. 安装临时隧道（保活 + 开机自启）\n2. 安装固定隧道（保活 + 开机自启）\n3. 查看状态 / 临时域名\n4. 重启隧道\n5. 停止隧道\n6. 查看日志\n7. 卸载隧道\n0. 退出\n'
-        ask '请选择：'
+        printf '\n%s  CLOUDFLARE · 隧道管理%s\n' "$C_CYAN" "$C_RESET"
+        printf '%s  ──────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
+        printf '  系统 %s%s%s  /  %s%s%s  ·  v%s\n' "$C_CYAN" "$ID" "$C_RESET" "$C_WHITE" "$MANAGER" "$C_RESET" "$VERSION"
+        if exists; then
+            case "$(cat "$BASE/mode")" in quick) label=临时隧道;; fixed) label=固定隧道;; *) label=未知模式;; esac
+            printf '  配置 %s%s%s\n' "$C_GREEN" "$label" "$C_RESET"
+        else
+            printf '  配置 %s尚未安装%s\n' "$C_DIM" "$C_RESET"
+        fi
+        printf '%s  ──────────────────────────────────────%s\n\n' "$C_DIM" "$C_RESET"
+        menu_item "$C_GREEN" '1.' '安装临时隧道（保活 + 开机自启）'
+        menu_item "$C_GREEN" '2.' '安装固定隧道（保活 + 开机自启）'
+        printf '\n'
+        menu_item "$C_CYAN" '3.' '查看状态 / 临时域名'
+        menu_item "$C_YELLOW" '4.' '重启隧道'
+        menu_item "$C_YELLOW" '5.' '停止隧道'
+        menu_item "$C_CYAN" '6.' '查看日志'
+        menu_item "$C_RED" '7.' '卸载隧道'
+        printf '\n'
+        menu_item "$C_DIM" '0.' '退出'
+        printf '%s  ──────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
+        ask '  请选择 [0–7]：'
         case "$REPLY" in
             1) setup quick;; 2) setup fixed;; 3) status;;
             4) if exists; then control restart; else printf '尚未安装。\n'; fi;;
