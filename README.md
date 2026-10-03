@@ -1,10 +1,1 @@
-flowchart TD
-    A["选择 sing-box 或 Xray"] --> B{"隧道模式"}
-    B -->|临时| C["读取保存的端口和当前域名"]
-    B -->|固定| D["首次输入域名和端口并保存"]
-    C --> E["从仓库 Raw 下载并校验核心"]
-    D --> E
-    E --> F["生成 UUID、WS 路径和本地配置"]
-    F --> G["检查配置并启动节点服务"]
-    G --> H["启用保活和开机自启"]
-    H --> I["输出并保存节点信息和分享链接"]
+<img width="1076" height="1694" alt="mermaid-diagram" src="https://github.com/user-attachments/assets/45644e35-0656-48c5-a0f3-307143ba50b6" />
