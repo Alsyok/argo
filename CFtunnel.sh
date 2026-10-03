@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.1.0
+VERSION=2.1.1
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -12,6 +12,7 @@ NBIN=/usr/local/lib/vps-node/core
 NSERVICE=vps-node
 NLOG=/var/log/vps-node.log
 RAW=https://raw.githubusercontent.com/Alsyok/argo/cores
+SCREEN_ACTIVE=0
 C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
     C_RESET=$(printf '\033[0m')
@@ -23,10 +24,11 @@ if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
     C_WHITE=$(printf '\033[1;37m')
 fi
 cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
-trap cleanup EXIT
+trap 'cleanup; terminal_restore' EXIT
 die() { printf '%s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+ask_form() { printf '\n' >&2; ask "$1"; }
 ask() { printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
-menu_item() { printf '  %s%3s%s  %s\n\n' "$1" "$2" "$C_RESET" "$3"; }
+menu_item() { printf '  %s%3s%s  %s\n' "$1" "$2" "$C_RESET" "$3"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
     [ -f /etc/os-release ] || die '无法识别系统。'
@@ -183,7 +185,7 @@ setup() {
         read_port 8080
         read_path
         while :; do
-            ask '粘贴 Tunnel Token（只粘贴 Token，不要整条命令）：'
+            ask_form '粘贴 Tunnel Token（只粘贴 Token，不要整条命令）：'
             token=$REPLY
             case "$token" in
                 ''|*[!A-Za-z0-9_+/=-]*) warn 'Token 为空或字符格式错误，请重新输入。';;
@@ -266,7 +268,7 @@ warn() { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
 rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"; }
 read_port() {
     while :; do
-        ask "本地 WS 端口 [$1]："
+        ask_form "本地 WS 端口 [$1]："
         port=${REPLY:-$1}
         case "$port" in ''|*[!0-9]*|??????*) warn '请输入 1–65535。'; continue;; esac
         port=$(printf '%s' "$port" | sed 's/^0*//'); port=${port:-0}
@@ -279,7 +281,7 @@ valid_domain() {
 }
 read_domain() {
     while :; do
-        ask '固定隧道域名（不含 https:// 和路径）：'
+        ask_form '固定隧道域名（不含 https:// 和路径）：'
         domain=$REPLY
         if valid_domain "$domain"; then return; fi
         warn '请输入完整域名，例如 node.example.com。'
@@ -287,7 +289,7 @@ read_domain() {
 }
 read_path() {
     while :; do
-        ask '本地 WebSocket 路径 [/argo]：'
+        ask_form '本地 WebSocket 路径 [/argo]：'
         ws_path=${REPLY:-/argo}
         if [ "${#ws_path}" -le 128 ] && printf '%s\n' "$ws_path" | grep -Eq '^/[A-Za-z0-9/._~-]*$'; then return; fi
         warn '路径需以 / 开头，使用字母、数字或 / . _ ~ -，请重新输入。'
@@ -295,7 +297,7 @@ read_path() {
 }
 read_protocol() {
     while :; do
-        ask '隧道传输：1 自动 / 2 HTTP2（禁 UDP 时选） / 3 QUIC [1]：'
+        ask_form '隧道传输：1 自动 / 2 HTTP2（禁 UDP 时选） / 3 QUIC [1]：'
         case "${REPLY:-1}" in 1) protocol=auto; return;; 2) protocol=http2; return;; 3) protocol=quic; return;; *) warn '请输入 1、2 或 3。';; esac
     done
 }
@@ -554,7 +556,7 @@ node_info() {
         return 0
     fi
     locate_country
-    case "$core" in sing-box) node_label="argo-singbox-$country_flag";; *) node_label="argo-Xray-$country_flag";; esac
+    case "$core" in sing-box) node_label="Argo-singbox-$country_flag";; *) node_label="Argo-Xray-$country_flag";; esac
     label_encoded=$(jq -nr --arg s "$node_label" '$s|@uri')
     path_encoded=$(jq -nr --arg s "$ws_path" '$s|@uri')
     link="vless://$uuid@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&host=$domain&path=$path_encoded#$label_encoded"
@@ -621,8 +623,19 @@ connection_report() {
     printf '%s  VLESS 实际代理流量请在客户端测试。%s\n' "$C_DIM" "$C_RESET"
     rule
 }
+terminal_enter() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
+        printf '\033[?1049h\033[2J\033[H'
+        SCREEN_ACTIVE=1
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+    fi
+}
+terminal_restore() {
+    if [ "$SCREEN_ACTIVE" = 1 ]; then printf '\033[?1049l'; fi
+}
 clear_screen() {
-    if [ -t 1 ]; then printf '\033[2J\033[H'; fi
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\033[2J\033[H'; fi
 }
 finish_screen() {
     printf '\n'
@@ -655,7 +668,7 @@ remove_node() {
     good '节点核心已卸载。'
 }
 header() {
-    printf '\n%s  ARGO · 隧道与节点管理%s\n' "$C_CYAN" "$C_RESET"; rule
+    printf '%s  ARGO · 隧道与节点管理%s\n' "$C_CYAN" "$C_RESET"; rule
     printf '  系统  %s%s%s / %s  ·  v%s\n' "$C_WHITE" "$ID" "$C_RESET" "$MANAGER" "$VERSION"
     if exists; then
         case "$(cat "$BASE/mode")" in quick) label=临时隧道;; *) label=固定隧道;; esac
@@ -680,6 +693,7 @@ run_action() {
 }
 main() {
     detect
+    terminal_enter
     clear_screen
     while :; do
         header
