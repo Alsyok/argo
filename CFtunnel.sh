@@ -1,12 +1,17 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=1.0.0
+VERSION=2.0.0
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
 LOG=/var/log/vps-tunnel/cloudflared.log
 TMP=
+NBASE=/etc/vps-node
+NBIN=/usr/local/lib/vps-node/core
+NSERVICE=vps-node
+NLOG=/var/log/vps-node.log
+RAW=https://raw.githubusercontent.com/Alsyok/argo/cores
 C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
     C_RESET=$(printf '\033[0m')
@@ -21,7 +26,7 @@ cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap cleanup EXIT
 die() { printf '%s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask() { printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
-menu_item() { printf '  %s%s%s  %s\n' "$1" "$2" "$C_RESET" "$3"; }
+menu_item() { printf '  %s%3s%s  %s\n' "$1" "$2" "$C_RESET" "$3"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
     [ -f /etc/os-release ] || die '无法识别系统。'
@@ -38,10 +43,10 @@ detect() {
 }
 dependencies() {
     if [ "$MANAGER" = openrc ]; then
-        apk add --no-cache curl ca-certificates
+        apk add --no-cache curl ca-certificates jq tar unzip
     else
         apt-get update
-        apt-get install -y curl ca-certificates
+        apt-get install -y curl ca-certificates jq tar unzip
     fi
 }
 download() {
@@ -76,13 +81,16 @@ cd "$BASE"
 # Quick Tunnel must not inherit ~/.cloudflared/config.yaml.
 export HOME="$BASE/home"
 mode=$(cat "$BASE/mode")
+protocol=$(cat "$BASE/protocol" 2>/dev/null || printf auto)
+metrics=$(cat "$BASE/metrics-port")
 if [ "$mode" = quick ]; then
     # Clear stale addresses on every new process launch.
+    rm -f "$BASE/domain-cache"
     : > /var/log/vps-tunnel/cloudflared.log
     port=$(cat "$BASE/port")
-    exec "$BIN" tunnel --no-autoupdate --loglevel info --log-directory /var/log/vps-tunnel --url "http://127.0.0.1:$port"
+    exec "$BIN" tunnel --no-autoupdate --protocol "$protocol" --edge-ip-version auto --metrics "127.0.0.1:$metrics" --loglevel info --log-directory /var/log/vps-tunnel --url "http://127.0.0.1:$port"
 else
-    exec "$BIN" tunnel --no-autoupdate --loglevel info --log-directory /var/log/vps-tunnel run --token-file "$BASE/token"
+    exec "$BIN" tunnel --no-autoupdate --protocol "$protocol" --edge-ip-version auto --metrics "127.0.0.1:$metrics" --loglevel info --log-directory /var/log/vps-tunnel run --token-file "$BASE/token"
 fi
 RUN
     chmod 700 "$BASE/run"
@@ -130,61 +138,50 @@ setup() {
     mode=$1
     confirm_replace || return 0
     if [ "$mode" = quick ]; then
-        while :; do
-            ask '请输入本地 HTTP / WebSocket 服务端口 [8080]：'
-            port=${REPLY:-8080}
-            case "$port" in
-                *[!0-9]*|??????*) printf '端口必须是 1–65535，请重新输入。\n'; continue;;
-            esac
-            port=$(printf '%s' "$port" | sed 's/^0*//')
-            port=${port:-0}
-            if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then break; fi
-            printf '端口必须是 1–65535，请重新输入。\n'
-        done
+        read_port 8080
     else
-        printf '请先在 Cloudflare 后台创建隧道，配置域名和本地服务地址。\n'
+        printf '请先在 CF 后台配置域名 → http://127.0.0.1:本地端口。\n'
+        read_domain
+        read_port 8080
         while :; do
             ask '粘贴 Tunnel Token（只粘贴 Token，不要整条命令）：'
             token=$REPLY
             case "$token" in
-                ''|*[!A-Za-z0-9_+/=-]*) printf 'Token 为空或包含不允许的字符，请重新输入。\n';;
+                ''|*[!A-Za-z0-9_+/=-]*) warn 'Token 为空或字符格式错误，请重新输入。';;
                 *) break;;
             esac
         done
     fi
+    read_protocol
     [ -x "$BIN" ] || download
     if exists; then stop_if_running; fi
     umask 077
     mkdir -p "$BASE/home"
     chmod 700 "$BASE" "$BASE/home"
     printf '%s\n' "$mode" > "$BASE/mode"
-    rm -f "$BASE/token" "$BASE/port"
+    rm -f "$BASE/token" "$BASE/domain"
+    printf '%s\n' "$protocol" > "$BASE/protocol"
+    printf '%s\n' "$port" > "$BASE/port"
+    choose_metrics
     if [ "$mode" = quick ]; then printf '%s\n' "$port" > "$BASE/port"
-    else printf '%s\n' "$token" > "$BASE/token"; unset token REPLY; fi
+    else printf '%s\n' "$token" > "$BASE/token"; printf '%s\n' "$domain" > "$BASE/domain"; unset token REPLY; fi
     mkdir -p /var/log/vps-tunnel
     : > "$LOG"
     write_runner
     write_service
     control start
     printf '已启用后台运行、进程退出自动重启、开机自启。\n'
-    if [ "$mode" = quick ]; then
-        printf '等待临时域名（最长 30 秒）…\n'
-        count=0
-        while [ "$count" -lt 15 ]; do
-            if grep -Eq 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG"; then address; return; fi
-            sleep 2
-            count=$((count + 1))
-        done
-        printf '尚未获取域名；请选择“查看日志”检查连接。\n'
+    if wait_connected; then
+        good '隧道已连接 Cloudflare。'
+        address
+        ask '继续安装节点？1 sing-box / 2 Xray / 0 暂不安装：'
+        case "$REPLY" in 1) install_node sing-box;; 2) install_node xray;; *) :;; esac
     else
-        printf '固定域名请在 Cloudflare 后台查看；服务启动不等于隧道已连接。\n'
+        warn '暂未确认连接，请查看日志；禁 UDP 的服务器可在菜单 15 切换 HTTP/2。'
     fi
 }
 address() {
-    if [ -f "$LOG" ]; then
-        domain=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG" | tail -n 1 || true)
-        [ -z "$domain" ] || printf '本次运行的临时域名：%s\n' "$domain"
-    fi
+    if current_domain; then printf '隧道域名：%s\n' "$domain"; fi
 }
 status() {
     exists || { printf '尚未安装本脚本管理的隧道。\n'; return; }
@@ -193,7 +190,8 @@ status() {
     if [ "$(cat "$BASE/mode")" = quick ]; then
         address
         printf '临时域名在重新启动后可能变化；停止时日志地址不可用。\n'
-    else printf '固定域名及连接状态：请在 Cloudflare 后台查看。\n'; fi
+    else address; fi
+    if connected; then good '已连接 Cloudflare。'; else warn '连接尚未确认。'; fi
 }
 logs() {
     [ ! -f "$LOG" ] || tail -n 80 "$LOG"
@@ -221,36 +219,394 @@ uninstall() {
     rm -f /var/log/vps-tunnel-service.log
     printf '已卸载。Cloudflare 后台的隧道和 DNS 记录需自行删除。\n'
 }
+
+good() { printf '%s  ✓ %s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
+warn() { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"; }
+read_port() {
+    while :; do
+        ask "本地 WS 端口 [$1]："
+        port=${REPLY:-$1}
+        case "$port" in ''|*[!0-9]*|??????*) warn '请输入 1–65535。'; continue;; esac
+        port=$(printf '%s' "$port" | sed 's/^0*//'); port=${port:-0}
+        if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then return; fi
+        warn '请输入 1–65535。'
+    done
+}
+valid_domain() {
+    [ "${#1}" -le 253 ] && printf '%s\n' "$1" | grep -Eq '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$'
+}
+read_domain() {
+    while :; do
+        ask '固定隧道域名（不含 https:// 和路径）：'
+        domain=$REPLY
+        if valid_domain "$domain"; then return; fi
+        warn '请输入完整域名，例如 node.example.com。'
+    done
+}
+read_protocol() {
+    while :; do
+        ask '隧道传输：1 自动 / 2 HTTP2（禁 UDP 时选） / 3 QUIC [1]：'
+        case "${REPLY:-1}" in 1) protocol=auto; return;; 2) protocol=http2; return;; 3) protocol=quic; return;; *) warn '请输入 1、2 或 3。';; esac
+    done
+}
+port_busy() {
+    target_hex=$(printf '%04X' "$1")
+    awk -v p="$target_hex" '$4 == "0A" {split($2,a,":"); if (toupper(a[length(a)]) == p) found=1} END {exit !found}' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+choose_metrics() {
+    # Retain the existing port; otherwise select an unused local port.
+    if [ -s "$BASE/metrics-port" ] && [ "$(cat "$BASE/metrics-port")" != "$port" ]; then return; fi
+    metrics=20241
+    while port_busy "$metrics" || [ "$metrics" = "$port" ]; do
+        metrics=$((metrics + 1))
+        [ "$metrics" -le 20260 ] || die '找不到可用的本地监控端口。'
+    done
+    printf '%s\n' "$metrics" > "$BASE/metrics-port"
+}
+connected() {
+    control status >/dev/null 2>&1 || return 1
+    [ -s "$BASE/metrics-port" ] || return 1
+    curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:$(cat "$BASE/metrics-port")/ready" >/dev/null 2>&1
+}
+wait_connected() {
+    printf '  正在确认 Cloudflare 连接（最长约 45 秒）…\n'
+    count=0
+    while [ "$count" -lt 15 ]; do
+        if connected; then return; fi
+        sleep 1; count=$((count + 1))
+    done
+    return 1
+}
+prepare_tunnel() {
+    exists || die '请先安装隧道。'
+    mode=$(cat "$BASE/mode")
+    case "$mode" in quick|fixed) :;; *) die '未知隧道模式。';; esac
+    if [ ! -s "$BASE/port" ]; then
+        read_port 8080; printf '%s\n' "$port" > "$BASE/port"
+    else port=$(cat "$BASE/port"); fi
+    if [ "$mode" = fixed ] && [ ! -s "$BASE/domain" ]; then
+        read_domain; printf '%s\n' "$domain" > "$BASE/domain"
+        warn "请确认 CF 后台的服务地址为 http://127.0.0.1:$port。"
+    fi
+    if [ ! -s "$BASE/protocol" ]; then
+        protocol=auto
+        if grep -q -- '--protocol http2' "$BASE/run"; then protocol=http2; fi
+        if grep -q -- '--protocol quic' "$BASE/run"; then protocol=quic; fi
+        printf '%s\n' "$protocol" > "$BASE/protocol"
+    fi
+    if [ ! -s "$BASE/metrics-port" ]; then
+        choose_metrics
+        write_runner
+        control restart
+    fi
+    connected || wait_connected || die '隧道尚未连接，请先查看日志或切换传输。'
+}
+set_transport() {
+    exists || die '尚未安装隧道。'
+    read_protocol
+    printf '%s\n' "$protocol" > "$BASE/protocol"
+    port=$(cat "$BASE/port" 2>/dev/null || printf 8080)
+    choose_metrics
+    write_runner
+    control restart
+    if wait_connected; then good '隧道已连接。'; address; else warn '尚未连接，请查看日志。'; fi
+}
+node_exists() { [ -s "$NBASE/core" ] && [ -x "$NBIN" ]; }
+node_control() {
+    if [ "$MANAGER" = openrc ]; then rc-service "$NSERVICE" "$1"
+    else systemctl "$1" "$NSERVICE.service"; fi
+}
+node_stop() { if node_control status >/dev/null 2>&1; then node_control stop; fi; }
+node_service() {
+    cat > "$NBASE/run" <<'NODE'
+#!/bin/sh
+set -eu
+cd /etc/vps-node
+case "$(cat core)" in
+    sing-box) exec /usr/local/lib/vps-node/core run -c /etc/vps-node/config.json;;
+    xray) exec /usr/local/lib/vps-node/core run -config /etc/vps-node/config.json;;
+    *) exit 1;;
+esac
+NODE
+    chmod 700 "$NBASE/run"
+    if [ "$MANAGER" = openrc ]; then
+        cat > /etc/init.d/vps-node <<'RC'
+#!/sbin/openrc-run
+name="VLESS WebSocket node"
+supervisor="supervise-daemon"
+command="/etc/vps-node/run"
+respawn_delay=5
+respawn_max=0
+respawn_period=60
+output_log="/var/log/vps-node.log"
+error_log="/var/log/vps-node.log"
+depend() { need net; after firewall; }
+RC
+        chmod 755 /etc/init.d/vps-node
+        rc-update add "$NSERVICE" default
+    else
+        cat > /etc/systemd/system/vps-node.service <<'UNIT'
+[Unit]
+Description=VLESS WebSocket node
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+ExecStart=/etc/vps-node/run
+Restart=always
+RestartSec=5
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable "$NSERVICE.service"
+    fi
+}
+fetch_core() {
+    curl -fLsS --retry 3 --connect-timeout 15 --max-time 60 "$RAW/manifest.json?t=$(date +%s)" -o "$TMP/manifest.json"
+    jq -e '.schema_version == 2 and .distribution == "github-raw"' "$TMP/manifest.json" >/dev/null || die 'Raw 版本清单格式错误，请确认工作流已经成功。'
+    asset_url=$(jq -er --arg c "$core" --arg a "$ARCH" '.cores[$c].assets[$a].download_url' "$TMP/manifest.json")
+    digest=$(jq -er --arg c "$core" --arg a "$ARCH" '.cores[$c].assets[$a].sha256' "$TMP/manifest.json")
+    core_version=$(jq -er --arg c "$core" '.cores[$c].version' "$TMP/manifest.json")
+    case "$asset_url" in "$RAW"/versions/*) :;; *) die '安装包地址不属于你的 Raw 仓库。';; esac
+    printf '%s' "$digest" | grep -Eq '^[a-f0-9]{64}$' || die '校验值格式错误。'
+    good "下载 $core $core_version / $ARCH"
+    curl -fL --retry 3 --connect-timeout 15 --max-time 300 "$asset_url" -o "$TMP/archive"
+    printf '%s  %s\n' "$digest" "$TMP/archive" | sha256sum -c - || die '安装包校验失败。'
+    if [ "$core" = sing-box ]; then
+        member=$(tar -tzf "$TMP/archive" | awk '/(^|\/)sing-box$/ {print}')
+        [ "$(printf '%s\n' "$member" | wc -l)" -eq 1 ] && [ -n "$member" ] || die '安装包结构错误。'
+        tar -xOzf "$TMP/archive" "$member" > "$TMP/core"
+    else
+        unzip -p "$TMP/archive" xray > "$TMP/core"
+    fi
+    chmod 755 "$TMP/core"
+    "$TMP/core" version
+}
+build_config() {
+    if [ "$core" = sing-box ]; then
+        jq -n --arg uuid "$uuid" --arg path "$ws_path" --argjson port "$port" '{log:{level:"info",timestamp:true},inbounds:[{type:"vless",tag:"vless-ws",listen:"127.0.0.1",listen_port:$port,users:[{uuid:$uuid}],transport:{type:"ws",path:$path}}],outbounds:[{type:"direct",tag:"direct"}]}' > "$TMP/config.json"
+        "$TMP/core" check -c "$TMP/config.json"
+    else
+        jq -n --arg uuid "$uuid" --arg path "$ws_path" --argjson port "$port" '{log:{loglevel:"warning"},inbounds:[{tag:"vless-ws",listen:"127.0.0.1",port:$port,protocol:"vless",settings:{clients:[{id:$uuid}],decryption:"none"},streamSettings:{network:"ws",security:"none",wsSettings:{path:$path}}}],outbounds:[{protocol:"freedom",tag:"direct"}]}' > "$TMP/config.json"
+        "$TMP/core" run -test -config "$TMP/config.json"
+    fi
+}
+rollback_node() {
+    if [ "${deploying:-0}" = 1 ]; then
+        warn '部署未完成，正在恢复原节点。'
+        node_stop || true
+        rm -rf "$NBASE"
+        rm -f "$NBIN"
+        if [ -d "$TMP/old-node" ]; then
+            cp -a "$TMP/old-node" "$NBASE"
+            cp "$TMP/old-core" "$NBIN"; chmod 755 "$NBIN"
+            if [ "$was_running" = 1 ]; then node_control start || true; fi
+        else
+            if [ "$MANAGER" = openrc ]; then
+                rc-update del "$NSERVICE" default >/dev/null 2>&1 || true
+                rm -f /etc/init.d/vps-node
+            else
+                systemctl disable "$NSERVICE.service" >/dev/null 2>&1 || true
+                rm -f /etc/systemd/system/vps-node.service
+                systemctl daemon-reload
+            fi
+        fi
+    fi
+    cleanup
+}
+install_node() {
+    core=$1
+    if node_exists; then
+        ask '已有节点。继续安装 / 切换并保留 UUID 和 WS 路径？输入 YES：'
+        [ "$REPLY" = YES ] || return 0
+    fi
+    dependencies
+    prepare_tunnel
+    if port_busy "$port" && ! node_control status >/dev/null 2>&1; then
+        die "端口 $port 被其他程序占用，请先处理；本脚本不会停止其他服务。"
+    fi
+    TMP=$(mktemp -d)
+    deploying=0; was_running=0
+    trap rollback_node EXIT
+    fetch_core
+    if node_exists; then
+        uuid=$(cat "$NBASE/uuid"); ws_path=$(cat "$NBASE/path")
+        cp -a "$NBASE" "$TMP/old-node"; cp "$NBIN" "$TMP/old-core"
+        if node_control status >/dev/null 2>&1; then was_running=1; fi
+    else
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+        ws_path="/argo-$(printf '%s' "$uuid" | cut -c 1-8)"
+    fi
+    build_config
+    deploying=1
+    if node_exists; then node_stop; fi
+    port_busy "$port" && die "端口 $port 仍被占用，已取消部署。"
+    umask 077
+    mkdir -p "$NBASE" /usr/local/lib/vps-node
+    chmod 700 "$NBASE" /usr/local/lib/vps-node
+    cp "$TMP/core" "$NBIN"; chmod 755 "$NBIN"
+    cp "$TMP/config.json" "$NBASE/config.json"
+    printf '%s\n' "$core" > "$NBASE/core"
+    printf '%s\n' "$core_version" > "$NBASE/version"
+    printf '%s\n' "$port" > "$NBASE/port"
+    printf '%s\n' "$uuid" > "$NBASE/uuid"
+    printf '%s\n' "$ws_path" > "$NBASE/path"
+    node_service
+    node_control start
+    count=0
+    while [ "$count" -lt 10 ]; do
+        if node_control status >/dev/null 2>&1 && port_busy "$port"; then break; fi
+        sleep 1; count=$((count + 1))
+    done
+    [ "$count" -lt 10 ] || die '节点未成功监听，请检查日志。'
+    deploying=0
+    good '节点已启动，保活和开机自启已启用。'
+    node_info
+}
+node_menu() {
+    printf '\n%s  选择节点核心%s\n' "$C_CYAN" "$C_RESET"; rule
+    menu_item "$C_GREEN" '1.' 'sing-box'
+    menu_item "$C_GREEN" '2.' 'Xray'
+    menu_item "$C_DIM" '0.' '返回'
+    while :; do
+        ask '请选择 [0–2]：'
+        case "$REPLY" in 1) install_node sing-box; return;; 2) install_node xray; return;; 0) return;; *) warn '请选择 0、1 或 2。';; esac
+    done
+}
+current_domain() {
+    [ -s "$BASE/mode" ] || return 1
+    if [ "$(cat "$BASE/mode")" = fixed ]; then
+        [ -s "$BASE/domain" ] || return 1
+        domain=$(cat "$BASE/domain")
+    else
+        control status >/dev/null 2>&1 || return 1
+        domain=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG" 2>/dev/null | tail -n 1 || true)
+        domain=${domain#https://}
+        if [ -n "$domain" ]; then
+            (umask 077; printf '%s\n' "$domain" > "$BASE/domain-cache")
+        elif [ -s "$BASE/domain-cache" ]; then domain=$(cat "$BASE/domain-cache"); fi
+    fi
+    valid_domain "$domain"
+}
+node_info() {
+    node_exists || die '尚未安装节点核心。'
+    command -v jq >/dev/null || dependencies
+    core=$(cat "$NBASE/core"); uuid=$(cat "$NBASE/uuid")
+    ws_path=$(cat "$NBASE/path"); port=$(cat "$NBASE/port")
+    if ! current_domain; then
+        warn '当前域名无法获取；上次保存的信息仅供参考。'
+        [ ! -s "$NBASE/node-info.txt" ] || cat "$NBASE/node-info.txt"
+        return 0
+    fi
+    path_encoded=$(jq -nr --arg s "$ws_path" '$s|@uri')
+    link="vless://$uuid@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&host=$domain&path=$path_encoded#Argo-$core"
+    umask 077
+    {
+        printf '核心：%s %s\n' "$core" "$(cat "$NBASE/version")"
+        printf '域名：%s\n客户端端口：443\n本地监听：127.0.0.1:%s\n' "$domain" "$port"
+        printf '协议：VLESS\nUUID：%s\n传输：WebSocket\nWS 路径：%s\n' "$uuid" "$ws_path"
+        printf '客户端 TLS：开启\nSNI / WS Host：%s\n本地 TLS：关闭\n\n%s\n' "$domain" "$link"
+    } > "$NBASE/node-info.txt.new"
+    mv "$NBASE/node-info.txt.new" "$NBASE/node-info.txt"
+    printf '%s\n' "$link" > "$NBASE/node-link.txt"
+    rule; printf '%s  NODE · 节点信息%s\n' "$C_CYAN" "$C_RESET"; rule
+    cat "$NBASE/node-info.txt"
+    rule
+    good "已保存至 $NBASE/node-info.txt"
+    if ! connected; then warn '隧道当前未确认连接，此链接不代表节点已可用。'; fi
+    if ! node_control status >/dev/null 2>&1; then warn '节点服务当前未运行。'; fi
+    if [ -s "$BASE/port" ] && [ "$(cat "$BASE/port")" != "$port" ]; then
+        warn '隧道端口与节点监听端口不一致，请重新配置节点。'
+    fi
+    if [ "$(cat "$BASE/mode")" = quick ]; then warn '临时域名变化后请重新查询并更新客户端。'; fi
+}
+node_logs() {
+    if [ "$MANAGER" = systemd ]; then journalctl -u "$NSERVICE.service" -n 60 --no-pager
+    elif [ -f "$NLOG" ]; then tail -n 60 "$NLOG"
+    else warn '暂无节点日志。'; fi
+}
+update_node() {
+    node_exists || die '尚未安装节点。'
+    install_node "$(cat "$NBASE/core")"
+}
+remove_node() {
+    node_exists || die '尚未安装节点。'
+    ask '删除节点核心、配置和保存的节点信息？输入 YES：'
+    [ "$REPLY" = YES ] || return 0
+    node_stop
+    if [ "$MANAGER" = openrc ]; then
+        rc-update del "$NSERVICE" default
+        rm -f /etc/init.d/vps-node
+    else
+        systemctl disable "$NSERVICE.service"
+        rm -f /etc/systemd/system/vps-node.service
+        systemctl daemon-reload
+    fi
+    rm -rf "$NBASE" /usr/local/lib/vps-node
+    rm -f "$NLOG"
+    good '节点核心已卸载。'
+}
+header() {
+    printf '\n%s  ARGO · 隧道与节点管理%s\n' "$C_CYAN" "$C_RESET"; rule
+    printf '  系统  %s%s%s / %s  ·  v%s\n' "$C_WHITE" "$ID" "$C_RESET" "$MANAGER" "$VERSION"
+    if exists; then
+        case "$(cat "$BASE/mode")" in quick) label=临时隧道;; *) label=固定隧道;; esac
+        if connected; then state=已连接; color=$C_GREEN
+        elif control status >/dev/null 2>&1; then state='运行中 · 连接待确认'; color=$C_YELLOW
+        else state=已停止; color=$C_DIM; fi
+        printf '  隧道  %s · %s%s%s\n' "$label" "$color" "$state" "$C_RESET"
+    else printf '  隧道  %s未安装%s\n' "$C_DIM" "$C_RESET"; fi
+    if node_exists; then
+        if node_control status >/dev/null 2>&1; then state=运行中; color=$C_GREEN; else state=已停止; color=$C_DIM; fi
+        printf '  核心  %s · %s%s%s\n' "$(cat "$NBASE/core")" "$color" "$state" "$C_RESET"
+    else printf '  核心  %s未安装%s\n' "$C_DIM" "$C_RESET"; fi
+    rule
+}
+run_action() {
+    # Keep operational failures inside a subshell, allowing return to the menu.
+    set +e
+    (set -eu; trap cleanup EXIT; "$@")
+    action_result=$?
+    set -e
+    if [ "$action_result" -ne 0 ]; then warn '操作未完成，请查看上面的错误提示。'; fi
+}
 main() {
     detect
     while :; do
-        printf '\n%s  CLOUDFLARE · 隧道管理%s\n' "$C_CYAN" "$C_RESET"
-        printf '%s  ──────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
-        printf '  系统 %s%s%s  /  %s%s%s  ·  v%s\n' "$C_CYAN" "$ID" "$C_RESET" "$C_WHITE" "$MANAGER" "$C_RESET" "$VERSION"
-        if exists; then
-            case "$(cat "$BASE/mode")" in quick) label=临时隧道;; fixed) label=固定隧道;; *) label=未知模式;; esac
-            printf '  配置 %s%s%s\n' "$C_GREEN" "$label" "$C_RESET"
-        else
-            printf '  配置 %s尚未安装%s\n' "$C_DIM" "$C_RESET"
-        fi
-        printf '%s  ──────────────────────────────────────%s\n\n' "$C_DIM" "$C_RESET"
+        header
+        printf '\n%s  TUNNEL / 隧道管理%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_GREEN" '1.' '安装临时隧道（保活 + 开机自启）'
         menu_item "$C_GREEN" '2.' '安装固定隧道（保活 + 开机自启）'
-        printf '\n'
-        menu_item "$C_CYAN" '3.' '查看状态 / 临时域名'
+        menu_item "$C_CYAN" '3.' '查看隧道状态 / 域名'
         menu_item "$C_YELLOW" '4.' '重启隧道'
         menu_item "$C_YELLOW" '5.' '停止隧道'
-        menu_item "$C_CYAN" '6.' '查看日志'
+        menu_item "$C_CYAN" '6.' '查看隧道日志'
         menu_item "$C_RED" '7.' '卸载隧道'
-        printf '\n'
+        printf '\n%s  NODE / 节点管理%s\n' "$C_CYAN" "$C_RESET"
+        menu_item "$C_GREEN" '8.' '安装 / 切换节点核心'
+        menu_item "$C_CYAN" '9.' '查询节点信息 / 分享链接'
+        menu_item "$C_YELLOW" '10.' '重启节点'
+        menu_item "$C_YELLOW" '11.' '停止节点'
+        menu_item "$C_CYAN" '12.' '查看节点日志'
+        menu_item "$C_GREEN" '13.' '更新节点核心'
+        menu_item "$C_RED" '14.' '卸载节点核心'
+        printf '\n%s  NETWORK / 网络设置%s\n' "$C_CYAN" "$C_RESET"
+        menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
         menu_item "$C_DIM" '0.' '退出'
-        printf '%s  ──────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
-        ask '  请选择 [0–7]：'
+        rule; ask '  请选择 [0–15]：'
         case "$REPLY" in
-            1) setup quick;; 2) setup fixed;; 3) status;;
-            4) if exists; then control restart; else printf '尚未安装。\n'; fi;;
-            5) if exists; then stop_if_running; else printf '尚未安装。\n'; fi;;
-            6) logs;; 7) uninstall;; 0) exit 0;; *) printf '请输入正确选项。\n';;
+            1) run_action setup quick;; 2) run_action setup fixed;; 3) run_action status;;
+            4) if exists; then run_action control restart; else warn '尚未安装。'; fi;;
+            5) run_action stop_if_running;; 6) run_action logs;; 7) run_action uninstall;;
+            8) run_action node_menu;; 9) run_action node_info;;
+            10) if node_exists; then run_action node_control restart; else warn '尚未安装节点。'; fi;;
+            11) if node_exists; then run_action node_stop; else warn '尚未安装节点。'; fi;;
+            12) run_action node_logs;; 13) run_action update_node;; 14) run_action remove_node;;
+            15) run_action set_transport;; 0) exit 0;; *) warn '请输入正确选项。';;
         esac
     done
 }
