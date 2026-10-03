@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.0.0
+VERSION=2.0.1
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -43,7 +43,7 @@ detect() {
 }
 dependencies() {
     if [ "$MANAGER" = openrc ]; then
-        apk add --no-cache curl ca-certificates jq tar unzip
+        apk add --no-cache curl ca-certificates jq tar unzip gcompat
     else
         apt-get update
         apt-get install -y curl ca-certificates jq tar unzip
