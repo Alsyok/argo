@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.1.1
+VERSION=2.2.0
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -25,9 +25,9 @@ if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
 fi
 cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap 'cleanup; terminal_restore' EXIT
-die() { printf '%s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
-ask() { printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
+ask() { printf '  %s%s%s' "$C_YELLOW" "${1#  }" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
 menu_item() { printf '  %s%3s%s  %s\n' "$1" "$2" "$C_RESET" "$3"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
@@ -69,8 +69,8 @@ control() {
 }
 confirm_replace() {
     if exists; then
-        ask '已有本脚本管理的隧道。替换配置？输入 YES 确认：'
-        [ "$REPLY" = YES ] || return 1
+        ask '已有本脚本管理的隧道。替换配置？输入 YES/y 确认：'
+        confirmed || return 1
     fi
 }
 write_runner() {
@@ -180,7 +180,7 @@ setup() {
         read_port 8080
         read_path
     else
-        printf '请先在 CF 后台配置域名 → http://127.0.0.1:本地端口。\n'
+        printf '%s  请先在 CF 后台 → 配置域名 → http://127.0.0.1:本地端口。%s\n' "$C_RED" "$C_RESET"
         read_domain
         read_port 8080
         read_path
@@ -246,8 +246,8 @@ stop_if_running() {
 }
 uninstall() {
     exists || { printf '尚未安装。\n'; return; }
-    ask '卸载本脚本的隧道、配置和日志？输入 YES 确认：'
-    [ "$REPLY" = YES ] || return 0
+    ask '卸载本脚本的隧道、配置和日志？输入 YES/y 确认：'
+    confirmed || return 0
     stop_if_running
     if [ "$MANAGER" = openrc ]; then
         rc-update del "$SERVICE" default
@@ -263,6 +263,7 @@ uninstall() {
     printf '已卸载。Cloudflare 后台的隧道和 DNS 记录需自行删除。\n'
 }
 
+confirmed() { case "$REPLY" in YES|yes|Y|y) return 0;; *) return 1;; esac; }
 good() { printf '%s  ✓ %s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
 warn() { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
 rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"; }
@@ -289,8 +290,8 @@ read_domain() {
 }
 read_path() {
     while :; do
-        ask_form '本地 WebSocket 路径 [/argo]：'
-        ws_path=${REPLY:-/argo}
+        ask_form "本地 WebSocket 路径 [${path_default:-/argo}]："
+        ws_path=${REPLY:-${path_default:-/argo}}
         if [ "${#ws_path}" -le 128 ] && printf '%s\n' "$ws_path" | grep -Eq '^/[A-Za-z0-9/._~-]*$'; then return; fi
         warn '路径需以 / 开头，使用字母、数字或 / . _ ~ -，请重新输入。'
     done
@@ -472,12 +473,37 @@ rollback_node() {
 }
 install_node() {
     core=$1
+    edit_node=0
     if node_exists; then
-        ask '已有节点。继续安装 / 切换并保留 UUID 和 WS 路径？输入 YES：'
-        [ "$REPLY" = YES ] || return 0
+        printf '\n'
+        menu_item "$C_GREEN" '1.' '保留 UUID、WS 路径和端口'
+        menu_item "$C_YELLOW" '2.' '修改 UUID、WS 路径和端口（留空沿用）'
+        menu_item "$C_DIM" '0.' '取消'
+        while :; do
+            ask '请选择 [0–2]：'
+            case "$REPLY" in 1) break;; 2) edit_node=1; break;; 0) return;; *) warn '请输入 0、1 或 2。';; esac
+        done
     fi
     dependencies
     prepare_tunnel
+    if node_exists; then
+        uuid=$(cat "$NBASE/uuid"); ws_path=$(cat "$NBASE/path"); port=$(cat "$NBASE/port")
+        if [ "$edit_node" = 1 ]; then
+            original_uuid=$uuid
+            while :; do
+                ask_form "UUID [$original_uuid]："
+                uuid=${REPLY:-$original_uuid}
+                if printf '%s\n' "$uuid" | grep -Eq '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$'; then break; fi
+                warn 'UUID 格式错误，请重新输入。'
+            done
+            path_default=$ws_path
+            read_path
+            read_port "$port"
+        fi
+    else
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+        ws_path=$(cat "$BASE/ws-path" 2>/dev/null || printf '/argo')
+    fi
     if port_busy "$port" && ! node_control status >/dev/null 2>&1; then
         die "端口 $port 被其他程序占用，请先处理；本脚本不会停止其他服务。"
     fi
@@ -486,14 +512,9 @@ install_node() {
     trap rollback_node EXIT
     fetch_core
     if node_exists; then
-        uuid=$(cat "$NBASE/uuid"); ws_path=$(cat "$NBASE/path")
         cp -a "$NBASE" "$TMP/old-node"; cp "$NBIN" "$TMP/old-core"
         if node_control status >/dev/null 2>&1; then was_running=1; fi
-    else
-        uuid=$(cat /proc/sys/kernel/random/uuid)
-        ws_path="/argo-$(printf '%s' "$uuid" | cut -c 1-8)"
     fi
-    if [ -s "$BASE/ws-path" ]; then ws_path=$(cat "$BASE/ws-path"); fi
     build_config
     deploying=1
     if node_exists; then node_stop; fi
@@ -517,6 +538,17 @@ install_node() {
     done
     [ "$count" -lt 10 ] || die '节点未成功监听，请检查日志。'
     deploying=0
+    previous_port=$(cat "$BASE/port")
+    printf '%s\n' "$port" > "$BASE/port"
+    printf '%s\n' "$ws_path" > "$BASE/ws-path"
+    if [ "$previous_port" != "$port" ]; then
+        if [ "$(cat "$BASE/mode")" = quick ]; then
+            control restart
+            if ! wait_connected; then warn '节点端口已更新，但隧道连接尚未恢复。'; fi
+        else
+            warn "请在 CF 后台把服务地址改为 http://127.0.0.1:$port。"
+        fi
+    fi
     good '节点已启动，保活和开机自启已启用。'
     node_info
 }
@@ -652,8 +684,8 @@ update_node() {
 }
 remove_node() {
     node_exists || die '尚未安装节点。'
-    ask '删除节点核心、配置和保存的节点信息？输入 YES：'
-    [ "$REPLY" = YES ] || return 0
+    ask '删除节点核心、配置和保存的节点信息？输入 YES/y：'
+    confirmed || return 0
     node_stop
     if [ "$MANAGER" = openrc ]; then
         rc-update del "$NSERVICE" default
@@ -668,7 +700,7 @@ remove_node() {
     good '节点核心已卸载。'
 }
 header() {
-    printf '%s  ARGO · 隧道与节点管理%s\n' "$C_CYAN" "$C_RESET"; rule
+    printf '%s  【 ARGO · 隧道与节点管理 】%s\n' "$C_CYAN" "$C_RESET"; rule
     printf '  系统  %s%s%s / %s  ·  v%s\n' "$C_WHITE" "$ID" "$C_RESET" "$MANAGER" "$VERSION"
     if exists; then
         case "$(cat "$BASE/mode")" in quick) label=临时隧道;; *) label=固定隧道;; esac
@@ -697,7 +729,7 @@ main() {
     clear_screen
     while :; do
         header
-        printf '\n%s  TUNNEL / 隧道管理%s\n' "$C_CYAN" "$C_RESET"
+        printf '\n%s  【 TUNNEL / 隧道管理 】%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_GREEN" '1.' '安装临时隧道（保活 + 开机自启）'
         menu_item "$C_GREEN" '2.' '安装固定隧道（保活 + 开机自启）'
         menu_item "$C_CYAN" '3.' '查看隧道状态 / 域名'
@@ -705,7 +737,7 @@ main() {
         menu_item "$C_YELLOW" '5.' '停止隧道'
         menu_item "$C_CYAN" '6.' '查看隧道日志'
         menu_item "$C_RED" '7.' '卸载隧道'
-        printf '\n%s  NODE / 节点管理%s\n' "$C_CYAN" "$C_RESET"
+        printf '\n%s  【 NODE / 节点管理 】%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_GREEN" '8.' '安装 / 切换节点核心'
         menu_item "$C_CYAN" '9.' '查询节点信息 / 分享链接'
         menu_item "$C_YELLOW" '10.' '重启节点'
@@ -713,7 +745,7 @@ main() {
         menu_item "$C_CYAN" '12.' '查看节点日志'
         menu_item "$C_GREEN" '13.' '更新节点核心'
         menu_item "$C_RED" '14.' '卸载节点核心'
-        printf '\n%s  NETWORK / 网络设置%s\n' "$C_CYAN" "$C_RESET"
+        printf '\n%s  【 NETWORK / 网络设置 】%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
         menu_item "$C_DIM" '0.' '退出'
         rule
