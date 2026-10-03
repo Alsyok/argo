@@ -1,7 +1,7 @@
 #!/bin/sh
 # VPS cleanup utility. Does not format disks or restore an OS baseline.
 set -eu
-VERSION=1.0.0
+VERSION=1.1.0
 RESET= CYAN= GREEN= YELLOW= RED=
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
     RESET=$(printf '\033[0m'); CYAN=$(printf '\033[1;36m')
@@ -86,6 +86,81 @@ node_cleanup() {
     yes || return 0
     remove_nodes
 }
+project_cleanup() {
+    note '仅卸载本项目的 vps-node / vps-tunnel，删除其配置、程序、节点信息和日志。'
+    for path in /etc/vps-node /etc/vps-tunnel /usr/local/lib/vps-node /usr/local/lib/vps-tunnel /var/log/vps-tunnel; do
+        if [ -e "$path" ]; then printf '  将删除：%s\n' "$path"; safe_tree "$path"; fi
+    done
+    ask '继续？YES/y 确认：'; yes || return 0
+    stop_service vps-node
+    stop_service vps-tunnel
+    for svc in vps-node vps-tunnel; do
+        rm -f "/etc/init.d/$svc" "/etc/conf.d/$svc" "/etc/systemd/system/$svc.service"
+    done
+    rm -rf /etc/vps-node /etc/vps-tunnel /usr/local/lib/vps-node /usr/local/lib/vps-tunnel /var/log/vps-tunnel
+    rm -f /var/log/vps-node.log /var/log/vps-tunnel-service.log
+    if [ "$MANAGER" = systemd ]; then systemctl daemon-reload; fi
+    note '本项目已卸载；Cloudflare 后台记录需自行删除。'
+}
+other_nodes() {
+    note '以下仅检查，不卸载。非标准服务名和目录可能无法识别。'
+    for program in sing-box singbox xray cloudflared; do
+        location=$(command -v "$program" 2>/dev/null || true)
+        [ -z "$location" ] || printf '  程序：%s → %s\n' "$program" "$location"
+        if [ "$MANAGER" = openrc ]; then
+            if [ -f "/etc/init.d/$program" ]; then rc-service "$program" status || true; fi
+        else systemctl --no-pager status "$program.service" 2>/dev/null || true; fi
+    done
+    for path in /etc/sing-box /etc/singbox /etc/xray /usr/local/etc/xray; do
+        [ ! -e "$path" ] || printf '  配置：%s\n' "$path"
+    done
+}
+package_installed() {
+    if [ "$MANAGER" = openrc ]; then apk info -e "$1" >/dev/null 2>&1
+    else dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; fi
+}
+choose_software() {
+    note '选择软件包卸载。支持以下常见应用；SSH、网络和系统包不在可选范围。'
+    count=0; choices=
+    for pkg in sing-box singbox xray cloudflared nginx apache2 mariadb-server mysql-server postgresql redis redis-server docker docker.io containerd; do
+        if package_installed "$pkg"; then
+            count=$((count + 1)); choices="$choices $pkg"
+            printf '  %s. %s\n' "$count" "$pkg"
+        fi
+    done
+    [ "$count" -gt 0 ] || { note '未找到支持卸载的软件包。手动安装的核心请用原脚本卸载。'; return; }
+    note '0. 返回'
+    while :; do
+        ask '请选择软件编号：'
+        case "$REPLY" in 0) return;; ''|*[!0-9]*|????*) note '编号错误，请重新输入。'; continue;; esac
+        selected=; index=0
+        for pkg in $choices; do index=$((index + 1)); if [ "$REPLY" -eq "$index" ]; then selected=$pkg; break; fi; done
+        [ -n "$selected" ] && break
+        note '编号错误，请重新输入。'
+    done
+    note "准备卸载软件包：$selected"
+    note '使用包管理器移除。数据目录不直接删除；删除数据请单独选择深度清理。'
+    if [ "$MANAGER" = openrc ]; then apk del --simulate "$selected"
+    else apt-get -s remove "$selected"; fi
+    # Reject removal plans affecting other explicit packages on Debian.
+    if [ "$MANAGER" = systemd ]; then
+        planned=$(apt-get -s remove "$selected" | awk '/^Remv / {print $2}')
+        for item in $planned; do [ "$item" = "$selected" ] || die "还会移除 $item，已取消。"; done
+    fi
+    ask '确认卸载？YES/y 确认：'; yes || return 0
+    case "$selected" in
+        mariadb-server|mysql-server) stop_service mariadb; stop_service mysql;;
+        docker.io) stop_service docker;; redis-server) stop_service redis-server; stop_service redis;;
+        *) stop_service "$selected";;
+    esac
+    if [ "$MANAGER" = openrc ]; then apk del --no-scripts "$selected"
+    else apt-get remove -y "$selected"; fi
+    note '软件包已移除。配置与用户数据保留。'
+    if [ "$MANAGER" = systemd ]; then
+        ask '进一步清除该软件包管理的残留配置（purge）？YES/y：'
+        if yes; then apt-get purge -y "$selected"; fi
+    fi
+}
 cache_cleanup() {
     note '清理软件包下载缓存；不删除运行中的临时文件。'
     ask '继续？YES/y 确认：'; yes || return 0
@@ -96,6 +171,10 @@ cache_cleanup() {
             find /var/cache/apk -type f -name '*.apk' -exec rm -f {} \;
         fi
     else apt-get clean; fi
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        systemd-tmpfiles --clean
+        note '临时文件已按系统 tmpfiles 过期策略清理。'
+    else note '没有 tmpfiles 清理策略，保留临时文件，避免删除正在使用的数据。'; fi
     note '缓存清理完成。'
 }
 old_logs() {
@@ -178,14 +257,16 @@ main() {
         printf '\n%s  VPS · 系统清理 v%s%s\n' "$CYAN" "$VERSION" "$RESET"
         note "系统：$ID / $MANAGER"
         note '──────────────────────────────────────────'
-        note '1. 查看软件与服务'
-        note '2. 清理标准节点 / 隧道安装'
-        note '3. 清理软件包缓存'
-        note '4. 清理旧日志'
-        printf '  %s5. 深度清理用户数据（预览后确认）%s\n' "$RED" "$RESET"
+        note '1. 查看已安装软件与运行服务'
+        note '2. 清理软件包缓存、临时文件'
+        note '3. 清理旧日志'
+        note '4. 卸载本项目的隧道和节点'
+        note '5. 检查其他脚本安装的 sing-box / Xray'
+        note '6. 选择软件并卸载、清理残留'
+        printf '  %s7. 深度清理用户数据（预览后确认）%s\n' "$RED" "$RESET"
         note '0. 退出'
-        ask '请选择 [0–5]：'
-        case "$REPLY" in 1) action inventory;; 2) action node_cleanup;; 3) action cache_cleanup;; 4) action old_logs;; 5) action deep_cleanup;; 0) exit 0;; *) note '请输入正确选项。';; esac
+        ask '请选择 [0–7]：'
+        case "$REPLY" in 1) action inventory;; 2) action cache_cleanup;; 3) action old_logs;; 4) action project_cleanup;; 5) action other_nodes;; 6) action choose_software;; 7) action deep_cleanup;; 0) exit 0;; *) note '请输入正确选项。';; esac
     done
 }
 main "$@"
