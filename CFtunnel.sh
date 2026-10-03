@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.0.1
+VERSION=2.1.0
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -26,7 +26,7 @@ cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap cleanup EXIT
 die() { printf '%s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask() { printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
-menu_item() { printf '  %s%3s%s  %s\n' "$1" "$2" "$C_RESET" "$3"; }
+menu_item() { printf '  %s%3s%s  %s\n\n' "$1" "$2" "$C_RESET" "$3"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
     [ -f /etc/os-release ] || die '无法识别系统。'
@@ -78,22 +78,59 @@ set -eu
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 cd "$BASE"
-# Quick Tunnel must not inherit ~/.cloudflared/config.yaml.
 export HOME="$BASE/home"
 mode=$(cat "$BASE/mode")
 protocol=$(cat "$BASE/protocol" 2>/dev/null || printf auto)
 metrics=$(cat "$BASE/metrics-port")
-if [ "$mode" = quick ]; then
-    # Clear stale addresses on every new process launch.
-    rm -f "$BASE/domain-cache"
-    : > /var/log/vps-tunnel/cloudflared.log
-    port=$(cat "$BASE/port")
-    exec "$BIN" tunnel --no-autoupdate --protocol "$protocol" --edge-ip-version auto --metrics "127.0.0.1:$metrics" --loglevel info --log-directory /var/log/vps-tunnel --url "http://127.0.0.1:$port"
-else
-    exec "$BIN" tunnel --no-autoupdate --protocol "$protocol" --edge-ip-version auto --metrics "127.0.0.1:$metrics" --loglevel info --log-directory /var/log/vps-tunnel run --token-file "$BASE/token"
+run_core() {
+    if [ "$mode" = quick ]; then
+        rm -f "$BASE/domain-cache"
+        : > /var/log/vps-tunnel/cloudflared.log
+        port=$(cat "$BASE/port")
+        exec "$BIN" tunnel --no-autoupdate --protocol "$1" --edge-ip-version auto --grace-period 2s --metrics "127.0.0.1:$metrics" --loglevel info --log-directory /var/log/vps-tunnel --url "http://127.0.0.1:$port"
+    else
+        exec "$BIN" tunnel --no-autoupdate --protocol "$1" --edge-ip-version auto --grace-period 2s --metrics "127.0.0.1:$metrics" --loglevel info --log-directory /var/log/vps-tunnel run --token-file "$BASE/token"
+    fi
+}
+if [ "$protocol" != auto ]; then
+    printf '%s\n' "$protocol" > "$BASE/effective-protocol"
+    run_core "$protocol"
 fi
+# Automatic mode actively checks readiness; it does not rely solely on cloudflared's fallback.
+active=$(cat "$BASE/effective-protocol" 2>/dev/null || printf quic)
+case "$active" in quic|http2) :;; *) active=quic;; esac
+CHILD=
+stop_child() {
+    if [ -n "$CHILD" ]; then
+        kill "$CHILD" 2>/dev/null || true
+        wait "$CHILD" 2>/dev/null || true
+        CHILD=
+    fi
+}
+trap 'stop_child; exit 0' INT TERM
+trap stop_child EXIT
+while :; do
+    printf '%s\n' "$active" > "$BASE/effective-protocol"
+    run_core "$active" &
+    CHILD=$!
+    failures=0
+    while kill -0 "$CHILD" 2>/dev/null; do
+        if curl --noproxy '*' -fsS --connect-timeout 1 --max-time 1 "http://127.0.0.1:$metrics/ready" >/dev/null 2>&1; then
+            failures=0
+        else
+            failures=$((failures + 1))
+        fi
+        [ "$failures" -lt 10 ] || break
+        sleep 2
+    done
+    stop_child
+    if [ "$active" = quic ]; then active=http2; else active=quic; fi
+    printf 'Automatic transport: retrying with %s\n' "$active" >&2
+    sleep 2
+done
 RUN
     chmod 700 "$BASE/run"
+    printf '%s\n' '2.1.0' > "$BASE/runner-version"
 }
 write_service() {
     if [ "$MANAGER" = openrc ]; then
@@ -139,10 +176,12 @@ setup() {
     confirm_replace || return 0
     if [ "$mode" = quick ]; then
         read_port 8080
+        read_path
     else
         printf '请先在 CF 后台配置域名 → http://127.0.0.1:本地端口。\n'
         read_domain
         read_port 8080
+        read_path
         while :; do
             ask '粘贴 Tunnel Token（只粘贴 Token，不要整条命令）：'
             token=$REPLY
@@ -160,6 +199,8 @@ setup() {
     chmod 700 "$BASE" "$BASE/home"
     printf '%s\n' "$mode" > "$BASE/mode"
     rm -f "$BASE/token" "$BASE/domain"
+    printf '%s\n' "$ws_path" > "$BASE/ws-path"
+    rm -f "$BASE/effective-protocol"
     printf '%s\n' "$protocol" > "$BASE/protocol"
     printf '%s\n' "$port" > "$BASE/port"
     choose_metrics
@@ -244,6 +285,14 @@ read_domain() {
         warn '请输入完整域名，例如 node.example.com。'
     done
 }
+read_path() {
+    while :; do
+        ask '本地 WebSocket 路径 [/argo]：'
+        ws_path=${REPLY:-/argo}
+        if [ "${#ws_path}" -le 128 ] && printf '%s\n' "$ws_path" | grep -Eq '^/[A-Za-z0-9/._~-]*$'; then return; fi
+        warn '路径需以 / 开头，使用字母、数字或 / . _ ~ -，请重新输入。'
+    done
+}
 read_protocol() {
     while :; do
         ask '隧道传输：1 自动 / 2 HTTP2（禁 UDP 时选） / 3 QUIC [1]：'
@@ -270,9 +319,9 @@ connected() {
     curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:$(cat "$BASE/metrics-port")/ready" >/dev/null 2>&1
 }
 wait_connected() {
-    printf '  正在确认 Cloudflare 连接（最长约 45 秒）…\n'
+    printf '  正在确认 Cloudflare 连接（自动模式会切换传输，最长约 90 秒）…\n'
     count=0
-    while [ "$count" -lt 15 ]; do
+    while [ "$count" -lt 30 ]; do
         if connected; then return; fi
         sleep 1; count=$((count + 1))
     done
@@ -295,7 +344,7 @@ prepare_tunnel() {
         if grep -q -- '--protocol quic' "$BASE/run"; then protocol=quic; fi
         printf '%s\n' "$protocol" > "$BASE/protocol"
     fi
-    if [ ! -s "$BASE/metrics-port" ]; then
+    if [ ! -s "$BASE/metrics-port" ] || [ "$(cat "$BASE/runner-version" 2>/dev/null || true)" != '2.1.0' ]; then
         choose_metrics
         write_runner
         control restart
@@ -305,6 +354,7 @@ prepare_tunnel() {
 set_transport() {
     exists || die '尚未安装隧道。'
     read_protocol
+    rm -f "$BASE/effective-protocol"
     printf '%s\n' "$protocol" > "$BASE/protocol"
     port=$(cat "$BASE/port" 2>/dev/null || printf 8080)
     choose_metrics
@@ -441,6 +491,7 @@ install_node() {
         uuid=$(cat /proc/sys/kernel/random/uuid)
         ws_path="/argo-$(printf '%s' "$uuid" | cut -c 1-8)"
     fi
+    if [ -s "$BASE/ws-path" ]; then ws_path=$(cat "$BASE/ws-path"); fi
     build_config
     deploying=1
     if node_exists; then node_stop; fi
@@ -502,10 +553,14 @@ node_info() {
         [ ! -s "$NBASE/node-info.txt" ] || cat "$NBASE/node-info.txt"
         return 0
     fi
+    locate_country
+    case "$core" in sing-box) node_label="argo-singbox-$country_flag";; *) node_label="argo-Xray-$country_flag";; esac
+    label_encoded=$(jq -nr --arg s "$node_label" '$s|@uri')
     path_encoded=$(jq -nr --arg s "$ws_path" '$s|@uri')
-    link="vless://$uuid@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&host=$domain&path=$path_encoded#Argo-$core"
+    link="vless://$uuid@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&host=$domain&path=$path_encoded#$label_encoded"
     umask 077
     {
+        printf '节点名称：%s\n出口地区：%s\n\n' "$node_label" "$country_name"
         printf '核心：%s %s\n' "$core" "$(cat "$NBASE/version")"
         printf '域名：%s\n客户端端口：443\n本地监听：127.0.0.1:%s\n' "$domain" "$port"
         printf '协议：VLESS\nUUID：%s\n传输：WebSocket\nWS 路径：%s\n' "$uuid" "$ws_path"
@@ -517,8 +572,7 @@ node_info() {
     cat "$NBASE/node-info.txt"
     rule
     good "已保存至 $NBASE/node-info.txt"
-    if ! connected; then warn '隧道当前未确认连接，此链接不代表节点已可用。'; fi
-    if ! node_control status >/dev/null 2>&1; then warn '节点服务当前未运行。'; fi
+    connection_report
     if [ -s "$BASE/port" ] && [ "$(cat "$BASE/port")" != "$port" ]; then
         warn '隧道端口与节点监听端口不一致，请重新配置节点。'
     fi
@@ -528,6 +582,56 @@ node_logs() {
     if [ "$MANAGER" = systemd ]; then journalctl -u "$NSERVICE.service" -n 60 --no-pager
     elif [ -f "$NLOG" ]; then tail -n 60 "$NLOG"
     else warn '暂无节点日志。'; fi
+}
+locate_country() {
+    country_flag=🌐; country_name=未知
+    # Geolocation of this VPS's egress IP; failure never blocks node installation.
+    geo=$(curl -fsS --connect-timeout 2 --max-time 4 https://ipapi.co/json/ 2>/dev/null || true)
+    code=$(printf '%s' "$geo" | jq -er '.country_code // empty' 2>/dev/null || true)
+    if printf '%s' "$code" | grep -Eq '^[A-Z]{2}$'; then
+        country_flag=$(jq -nr --arg c "$code" '$c|explode|map(.+127397)|implode')
+        country_name=$(printf '%s' "$geo" | jq -r '.country_name // "未知"')
+        (umask 077; printf '%s\n' "$code" > "$NBASE/country-code"; printf '%s\n' "$country_name" > "$NBASE/country-name")
+    elif [ -s "$NBASE/country-code" ]; then
+        code=$(cat "$NBASE/country-code")
+        if printf '%s' "$code" | grep -Eq '^[A-Z]{2}$'; then
+            country_flag=$(jq -nr --arg c "$code" '$c|explode|map(.+127397)|implode')
+            country_name=$(cat "$NBASE/country-name" 2>/dev/null || printf 未知)
+        fi
+    fi
+}
+connection_report() {
+    printf '\n'; rule
+    if connected; then good '隧道：已连接 Cloudflare'; else warn '隧道：未确认连接'; fi
+    if node_control status >/dev/null 2>&1 && port_busy "$port"; then
+        good "节点：运行中，监听 127.0.0.1:$port"
+        # Verify TLS and the end-to-end WebSocket upgrade, without claiming a VLESS traffic test.
+        check_headers=$(mktemp)
+        curl --noproxy '*' -sS --http1.1 --connect-timeout 3 --max-time 5 \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+            -D "$check_headers" -o /dev/null "https://$domain$ws_path" 2>/dev/null || true
+        if grep -Eq '^HTTP/[^ ]+ 101([[:space:]]|$)' "$check_headers"; then
+            good 'WS 链路：TLS → CF 隧道 → 节点握手成功'
+        else
+            warn 'WS 链路：尚未验证成功，请检查 CF 域名、端口和路径。'
+        fi
+        rm -f "$check_headers"
+    else warn '节点：未运行或未监听'; fi
+    printf '%s  VLESS 实际代理流量请在客户端测试。%s\n' "$C_DIM" "$C_RESET"
+    rule
+}
+clear_screen() {
+    if [ -t 1 ]; then printf '\033[2J\033[H'; fi
+}
+finish_screen() {
+    printf '\n'
+    menu_item "$C_CYAN" '1.' '返回首页'
+    menu_item "$C_DIM" '0.' '退出脚本'
+    while :; do
+        ask '请选择 [0–1]：'
+        case "$REPLY" in 1) return;; 0) exit 0;; *) warn '请输入 0 或 1。';; esac
+    done
 }
 update_node() {
     node_exists || die '尚未安装节点。'
@@ -576,6 +680,7 @@ run_action() {
 }
 main() {
     detect
+    clear_screen
     while :; do
         header
         printf '\n%s  TUNNEL / 隧道管理%s\n' "$C_CYAN" "$C_RESET"
@@ -597,7 +702,11 @@ main() {
         printf '\n%s  NETWORK / 网络设置%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
         menu_item "$C_DIM" '0.' '退出'
-        rule; ask '  请选择 [0–15]：'
+        rule
+        while :; do
+            ask '  请选择 [0–15]：'
+            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15) break;; *) warn '请输入 0–15，重新选择即可。';; esac
+        done
         case "$REPLY" in
             1) run_action setup quick;; 2) run_action setup fixed;; 3) run_action status;;
             4) if exists; then run_action control restart; else warn '尚未安装。'; fi;;
@@ -608,6 +717,8 @@ main() {
             12) run_action node_logs;; 13) run_action update_node;; 14) run_action remove_node;;
             15) run_action set_transport;; 0) exit 0;; *) warn '请输入正确选项。';;
         esac
+        finish_screen
+        clear_screen
     done
 }
 main "$@"
