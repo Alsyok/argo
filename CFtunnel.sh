@@ -674,14 +674,13 @@ connection_report() {
 }
 terminal_enter() {
     if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
-        printf '\033[?1049h\033[2J\033[H'
-        SCREEN_ACTIVE=1
+        # Use the normal terminal so mobile SSH retains scrollback.
         trap 'exit 130' INT
         trap 'exit 143' TERM
     fi
 }
 terminal_restore() {
-    if [ "$SCREEN_ACTIVE" = 1 ]; then printf '\033[?1049l'; fi
+    : # Normal terminal: leave output available after exit.
 }
 clear_screen() {
     if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\033[2J\033[H'; fi
