@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.3.0
+VERSION=2.3.1
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -13,10 +13,12 @@ NSERVICE=vps-node
 NLOG=/var/log/vps-node.log
 RAW=https://raw.githubusercontent.com/Alsyok/argo/cores
 SCREEN_ACTIVE=0
-C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
+C_BLUE= C_PURPLE= C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
     C_RESET=$(printf '\033[0m')
     C_CYAN=$(printf '\033[1;36m')
+    C_BLUE=$(printf '\033[1;34m')
+    C_PURPLE=$(printf '\033[1;35m')
     C_GREEN=$(printf '\033[1;32m')
     C_YELLOW=$(printf '\033[1;33m')
     C_RED=$(printf '\033[1;31m')
@@ -28,7 +30,7 @@ trap 'cleanup; terminal_restore' EXIT
 die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
 ask() { printf '  %s%s%s' "$C_YELLOW" "${1#  }" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
-menu_item() { printf '  %s%3s%s  %s\n' "$1" "$2" "$C_RESET" "$3"; }
+menu_item() { printf '  %s%3s  %s%s\n' "$1" "$2" "$3" "$C_RESET"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
     [ -f /etc/os-release ] || die '无法识别系统。'
@@ -583,12 +585,24 @@ current_domain() {
     fi
     valid_domain "$domain"
 }
+print_node_info() {
+    while IFS= read -r info_line || [ -n "$info_line" ]; do
+        info_color=
+        case "$info_line" in
+            域名：*|'SNI / WS Host：'*) info_color=$C_CYAN;;
+            UUID：*) info_color=$C_PURPLE;;
+            'WS 路径：'*) info_color=$C_YELLOW;;
+            vless://*) info_color=$C_WHITE;;
+        esac
+        printf '%s%s%s\n' "$info_color" "$info_line" "$C_RESET"
+    done < "$NBASE/node-info.txt"
+}
 node_info() {
     node_exists || die '尚未安装节点核心。'
     if [ -x "$SYNCBIN" ] && [ "${api_local_changed:-0}" != 1 ]; then
         if ! "$SYNCBIN" --once foreground; then
             warn '自动同步未完成，保留上次有效节点信息。'
-            [ ! -s "$NBASE/node-info.txt" ] || cat "$NBASE/node-info.txt"
+            [ ! -s "$NBASE/node-info.txt" ] || print_node_info
             return 0
         fi
     fi
@@ -597,7 +611,7 @@ node_info() {
     ws_path=$(cat "$NBASE/path"); port=$(cat "$NBASE/port")
     if ! current_domain; then
         warn '当前域名无法获取；上次保存的信息仅供参考。'
-        [ ! -s "$NBASE/node-info.txt" ] || cat "$NBASE/node-info.txt"
+        [ ! -s "$NBASE/node-info.txt" ] || print_node_info
         return 0
     fi
     locate_country
@@ -615,8 +629,8 @@ node_info() {
     } > "$NBASE/node-info.txt.new"
     mv "$NBASE/node-info.txt.new" "$NBASE/node-info.txt"
     printf '%s\n' "$link" > "$NBASE/node-link.txt"
-    rule; printf '%s  NODE · 节点信息%s\n' "$C_CYAN" "$C_RESET"; rule
-    cat "$NBASE/node-info.txt"
+    rule; printf '%s  NODE · 节点信息%s\n' "$C_PURPLE" "$C_RESET"; rule
+    print_node_info
     rule
     good "已保存至 $NBASE/node-info.txt"
     connection_report
@@ -731,7 +745,7 @@ remove_node() {
 }
 header() {
     printf '%s  【 ARGO · 隧道与节点管理 】%s\n' "$C_CYAN" "$C_RESET"; rule
-    printf '  系统  %s%s%s / %s  ·  v%s\n' "$C_WHITE" "$ID" "$C_RESET" "$MANAGER" "$VERSION"
+    printf '  系统  %s%s%s / %s  ·  %sv%s%s\n' "$C_WHITE" "$ID" "$C_RESET" "$MANAGER" "$C_PURPLE" "$VERSION" "$C_RESET"
     if exists; then
         case "$(cat "$BASE/mode")" in quick) label=临时隧道;; *) label=固定隧道;; esac
         if connected; then state=已连接; color=$C_GREEN
@@ -992,6 +1006,15 @@ api_rollback() {
                 api_request PUT "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/rollback-result.json" "$TMP/rollback-body.json" || warn 'CF 路由恢复失败，请在后台检查。'
             else warn 'CF 配置已被其它操作修改或无法读取，未覆盖它；请检查后台路由。'; fi
         fi
+        if [ "${api_name_changed:-0}" = 1 ]; then
+            if api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-rollback-current.json"; then
+                rollback_name=$(jq -r '.result.name' "$TMP/name-rollback-current.json")
+                if [ "$rollback_name" = "$new_tunnel_name" ]; then
+                    jq -n --arg n "$old_tunnel_name" '{name:$n}' > "$TMP/name-rollback-body.json"
+                    api_request PATCH "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-rollback-result.json" "$TMP/name-rollback-body.json" || warn '隧道名称恢复失败，请检查 CF 后台。'
+                elif [ "$rollback_name" != "$old_tunnel_name" ]; then warn '隧道名称已被其它操作修改，未覆盖它。'; fi
+            else warn '无法确认隧道名称，请检查 CF 后台。'; fi
+        fi
         if [ "${api_dns_created:-}" != '' ]; then
             if api_request GET "/zones/$zone_id/dns_records/$api_dns_created" "$TMP/rollback-dns.json" &&
                jq -e --arg h "$domain" --arg t "$tunnel_id.cfargotunnel.com" '.result.name == $h and .result.type == "CNAME" and .result.content == $t' "$TMP/rollback-dns.json" >/dev/null; then
@@ -1027,7 +1050,32 @@ api_deploy() {
         api_choose_tunnel
         if [ -s "$BASE/domain" ]; then domain=$(cat "$BASE/domain"); fi
     fi
+    old_tunnel_name=; new_tunnel_name=
+    if [ "$api_edit" = edit ]; then
+        api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-before.json" || die '读取隧道名称失败。'
+        old_tunnel_name=$(jq -er '.result.name | select(type == "string" and length > 0)' "$TMP/name-before.json")
+        while :; do
+            ask_form "隧道名称 [$old_tunnel_name，留空保留]："
+            new_tunnel_name=${REPLY:-$old_tunnel_name}
+            [ -n "$REPLY" ] || break
+            if [ "${#new_tunnel_name}" -le 100 ] && printf '%s' "$new_tunnel_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then break; fi
+            warn '名称请使用字母、数字、点、下划线或短横线（最多 100 字符）。'
+        done
+    fi
     api_read_parameters
+    # A display-name-only edit never fetches a token or changes routes/local services.
+    if [ "$api_edit" = edit ] && node_exists &&
+       [ "$domain" = "$(cat "$BASE/domain")" ] && [ "$port" = "$(cat "$NBASE/port")" ] &&
+       [ "$uuid" = "$(cat "$NBASE/uuid")" ] && [ "$ws_path" = "$(cat "$NBASE/path")" ] &&
+       [ "$core" = "$(cat "$NBASE/core")" ] && [ "$protocol" = "$(cat "$BASE/protocol")" ]; then
+        if [ "$new_tunnel_name" != "$old_tunnel_name" ]; then
+            ask '应用隧道名称修改？输入 YES/y：'; confirmed || return 0
+            jq -n --arg n "$new_tunnel_name" '{name:$n}' > "$TMP/name-body.json"
+            api_request PATCH "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-result.json" "$TMP/name-body.json" || die '修改隧道名称失败，请重新查看 CF 中的名称。'
+            good "隧道名称已更新：$new_tunnel_name"
+        else good '配置未变化。'; fi
+        return 0
+    fi
     if [ -s "$BASE/metrics-port" ] && [ "$(cat "$BASE/metrics-port")" = "$port" ]; then die '节点端口与隧道监控端口冲突，请换一个端口。'; fi
     if port_busy "$port"; then
         node_exists && node_control status >/dev/null 2>&1 && [ "$(cat "$NBASE/port")" = "$port" ] || die "端口 $port 被其它服务占用。"
@@ -1047,7 +1095,7 @@ api_deploy() {
     fi
     rule; printf '  将部署：%s → http://127.0.0.1:%s\n  核心：%s · WS 路径：%s\n' "$domain" "$port" "$core" "$ws_path"
     ask '应用以上配置？输入 YES/y：'; confirmed || return 0
-    api_committed=0; api_local_changed=0; api_remote_changed=0; api_new_tunnel=0; api_dns_created=
+    api_committed=0; api_local_changed=0; api_remote_changed=0; api_new_tunnel=0; api_dns_created=; api_name_changed=0
     api_snapshot
     trap api_rollback EXIT
     trap 'exit 130' INT; trap 'exit 143' TERM
@@ -1082,6 +1130,13 @@ api_deploy() {
     if [ "$api_new_tunnel" != 1 ]; then
         api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/remote-check.json" || die '提交前读取路由失败。'
         [ "$(jq -cS '.result.config' "$TMP/remote-check.json")" = "$(jq -cS '.config' "$TMP/remote-before.json")" ] || die 'CF 路由刚被修改，请重新操作。'
+    fi
+    if [ "$api_edit" = edit ] && [ "$new_tunnel_name" != "$old_tunnel_name" ]; then
+        api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-check.json" || die '提交前读取隧道名称失败。'
+        [ "$(jq -r '.result.name' "$TMP/name-check.json")" = "$old_tunnel_name" ] || die '隧道名称刚被修改，请重新操作。'
+        jq -n --arg n "$new_tunnel_name" '{name:$n}' > "$TMP/name-body.json"
+        api_name_changed=1
+        api_request PATCH "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-result.json" "$TMP/name-body.json" || die '修改隧道名称失败。'
     fi
     api_remote_changed=1
     api_request PUT "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/remote-result.json" "$TMP/remote-after.json" || die '更新路由失败。'
@@ -1121,21 +1176,35 @@ api_deploy() {
         printf '  旧域名 %s 的 DNS 保留，确认不再需要后可在 CF 后台删除。\n' "$old_hostname"
     fi
 }
+api_check_access() {
+    api_load_auth
+    TMP=$(mktemp -d); chmod 700 "$TMP"
+    api_request GET "/accounts/$account_id/cfd_tunnel?is_deleted=false&per_page=1" "$TMP/access-account.json" || die 'API 账户验证失败，请重新接入。'
+    api_request GET "/zones/$zone_id" "$TMP/access-zone.json" || die 'API 域名区域验证失败，请重新接入。'
+    jq -e --arg a "$account_id" '.result.account.id == $a and .result.status == "active"' "$TMP/access-zone.json" >/dev/null || die '域名区域与账户不匹配。'
+}
 api_menu() {
+    if [ -s "$APIBASE/auth.json" ]; then
+        run_action api_check_access
+        if [ "$action_result" != 0 ]; then run_action api_connect; [ "$action_result" = 0 ] || return; fi
+    else
+        printf '  请先接入 CF API。\n'
+        run_action api_connect; [ "$action_result" = 0 ] || return
+    fi
     while :; do
         printf '\n%s  【 CF API 模式 】%s\n' "$C_CYAN" "$C_RESET"; rule
-        menu_item "$C_GREEN" '1.' 'API 接入'
-        menu_item "$C_GREEN" '2.' '自动部署'
-        menu_item "$C_YELLOW" '3.' '修改配置'
+        printf '  账户：%s已接入%s · 域名区域：%s%s%s\n' "$C_GREEN" "$C_RESET" "$C_CYAN" "$(jq -r '.zone_name' "$APIBASE/auth.json")" "$C_RESET"
+        menu_item "$C_GREEN" '1.' '自动部署'
+        menu_item "$C_YELLOW" '2.' '修改配置'
+        menu_item "$C_YELLOW" '3.' '更换 API 凭据 / 域名区域'
         menu_item "$C_DIM" '0.' '返回上一级'
         ask '请选择 [0–3]：'
         case "$REPLY" in
-            1) run_action api_connect;;
-            2) run_action api_deploy deploy; API_DONE=1; return;;
-            3) run_action api_deploy edit; API_DONE=1; return;;
+            1) run_action api_deploy deploy; API_DONE=1; return;;
+            2) run_action api_deploy edit; API_DONE=1; return;;
+            3) run_action api_connect;;
             0) return;; *) warn '请输入 0、1、2 或 3。';;
         esac
-        # Results remain visible until the user returns to this submenu.
     done
 }
 fixed_menu() {
@@ -1419,20 +1488,20 @@ main() {
     clear_screen
     while :; do
         header
-        printf '\n%s  【 TUNNEL / 隧道管理 】%s\n' "$C_CYAN" "$C_RESET"
+        printf '\n%s  【 TUNNEL / 隧道管理 】%s\n' "$C_BLUE" "$C_RESET"
         menu_item "$C_GREEN" '1.' '安装临时隧道（保活 + 开机自启）'
         menu_item "$C_GREEN" '2.' '安装固定隧道（保活 + 开机自启）'
-        menu_item "$C_CYAN" '3.' '查看隧道状态 / 域名'
+        menu_item "$C_BLUE" '3.' '查看隧道状态 / 域名'
         menu_item "$C_YELLOW" '4.' '重启隧道'
         menu_item "$C_YELLOW" '5.' '停止隧道'
-        menu_item "$C_CYAN" '6.' '查看隧道日志'
+        menu_item "$C_BLUE" '6.' '查看隧道日志'
         menu_item "$C_RED" '7.' '卸载隧道'
-        printf '\n%s  【 NODE / 节点管理 】%s\n' "$C_CYAN" "$C_RESET"
+        printf '\n%s  【 NODE / 节点管理 】%s\n' "$C_PURPLE" "$C_RESET"
         menu_item "$C_GREEN" '8.' '安装 / 切换节点核心'
-        menu_item "$C_CYAN" '9.' '查询节点信息 / 分享链接'
+        menu_item "$C_BLUE" '9.' '查询节点信息 / 分享链接'
         menu_item "$C_YELLOW" '10.' '重启节点'
         menu_item "$C_YELLOW" '11.' '停止节点'
-        menu_item "$C_CYAN" '12.' '查看节点日志'
+        menu_item "$C_BLUE" '12.' '查看节点日志'
         menu_item "$C_GREEN" '13.' '更新节点核心'
         menu_item "$C_RED" '14.' '卸载节点核心'
         printf '\n%s  【 NETWORK / 网络设置 】%s\n' "$C_CYAN" "$C_RESET"
