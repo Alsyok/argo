@@ -30,9 +30,12 @@ trap 'cleanup; terminal_restore' EXIT
 die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
 ask() {
-    ask_color=$C_CYAN
-    case "$1" in *YES/y*NO/n*) ask_color=$C_PURPLE;; esac
-    printf '  %s%s%s' "$ask_color" "${1#  }" "$C_RESET" >&2
+    case "$1" in
+        *'输入 “YES/y” 继续，“NO/n” 取消：'*)
+            ask_prefix=${1%%输入 “YES/y” 继续，“NO/n” 取消：*}
+            printf '  %s%s%s%s%s' "$C_CYAN" "${ask_prefix#  }" "$C_PURPLE" '输入 “YES/y” 继续，“NO/n” 取消：' "$C_RESET" >&2;;
+        *) printf '  %s%s%s' "$C_CYAN" "${1#  }" "$C_RESET" >&2;;
+    esac
     IFS= read -r REPLY || exit 0
     REPLY=$(printf '%s' "$REPLY" | tr -d '\r')
 }
