@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.3.1
+VERSION=2.3.2
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -29,8 +29,8 @@ cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap 'cleanup; terminal_restore' EXIT
 die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
-ask() { printf '  %s%s%s' "$C_YELLOW" "${1#  }" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
-menu_item() { printf '  %s%3s  %s%s\n' "$1" "$2" "$3" "$C_RESET"; }
+ask() { printf '  %s%s%s' "$C_CYAN" "${1#  }" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
+menu_item() { printf '  %s%3s%s  %s%s%s\n' "$C_WHITE" "$2" "$C_RESET" "$1" "$3" "$C_RESET"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
     [ -f /etc/os-release ] || die '无法识别系统。'
@@ -840,8 +840,8 @@ api_connect() {
     dependencies
     TMP=$(mktemp -d); chmod 700 "$TMP"
     printf '\n%s  【 CF API 接入 】%s\n' "$C_CYAN" "$C_RESET"; rule
-    printf '  Token 权限：账户 Cloudflare Tunnel 编辑；区域 DNS 编辑、Zone 读取。\n'
-    printf '  API Token 与 Tunnel Token 不同；凭据只保存在本机，不上传仓库。\n'
+    printf '  %sToken 权限：%s账户 %sCloudflare Tunnel 编辑%s；区域 %sDNS 编辑、Zone 读取%s。\n' "$C_CYAN" "$C_RESET" "$C_PURPLE" "$C_RESET" "$C_PURPLE" "$C_RESET"
+    printf '  %sAPI Token 与 Tunnel Token 不同；凭据只保存在本机，不上传仓库。%s\n' "$C_DIM" "$C_RESET"
     old_account=$(jq -r '.account_id // empty' "$APIBASE/auth.json" 2>/dev/null || true)
     while :; do
         ask_form 'API Token（留空沿用已保存值）：'
@@ -1176,6 +1176,105 @@ api_deploy() {
         printf '  旧域名 %s 的 DNS 保留，确认不再需要后可在 CF 后台删除。\n' "$old_hostname"
     fi
 }
+
+api_current_tunnel() {
+    local_tunnel_id=
+    if [ -s "$APIBASE/target.json" ] && jq -e --arg a "$account_id" '.account_id == $a' "$APIBASE/target.json" >/dev/null; then
+        local_tunnel_id=$(jq -r '.tunnel_id // ""' "$APIBASE/target.json")
+    elif [ -s "$BASE/token" ]; then
+        local_tunnel_id=$(jq -Rr 'try (fromjson) catch .' "$BASE/token" | jq -Rr 'try (@base64d|fromjson|.t // "") catch ""' 2>/dev/null || true)
+    fi
+}
+api_delete_selected() {
+    printf '\n  将删除以下 CF 隧道：\n'
+    jq -r '.[]|"  · \(.name) · \(.id)"' "$TMP/delete-selected.json"
+    printf '  以下关联 DNS 来自当前 API 有权限读取的账户域名区域：\n'
+    # Discover all authorized zones, not merely the enrollment zone.
+    api_collect "/zones?account.id=$account_id&status=active" "$TMP/delete-zones.json" || die '读取域名区域失败，未执行删除。'
+    printf '[]\n' > "$TMP/delete-dns.json"
+    jq -r '.[].id' "$TMP/delete-zones.json" > "$TMP/delete-zone-ids"
+    while IFS= read -r delete_zone; do
+        valid_id "$delete_zone" || die 'Zone ID 格式错误。'
+        api_collect "/zones/$delete_zone/dns_records?type=CNAME" "$TMP/zone-dns.json" || die '读取关联 DNS 失败，未执行删除。'
+        jq --arg z "$delete_zone" --slurpfile t "$TMP/delete-selected.json" '[.[]|select(.type == "CNAME")|. as $d|$t[0][]|select(($d.content|ascii_downcase|rtrimstr(".")) == ((.id|ascii_downcase)+".cfargotunnel.com"))|$d+{zone_id:$z,tunnel_id:.id}]' "$TMP/zone-dns.json" > "$TMP/matched-dns.json"
+        jq -s '.[0]+.[1]' "$TMP/delete-dns.json" "$TMP/matched-dns.json" > "$TMP/delete-dns-next.json"
+        mv "$TMP/delete-dns-next.json" "$TMP/delete-dns.json"
+    done < "$TMP/delete-zone-ids"
+    jq -r '.[]|"  · \(.name) → \(.content)"' "$TMP/delete-dns.json"
+    [ "$(jq length "$TMP/delete-dns.json")" != 0 ] || printf '  （未找到关联 DNS）\n'
+    warn '将删除选中的 CF 隧道和上述 DNS；权限范围外的 DNS 需自行检查。其它 VPS 若共用隧道也会受影响。'
+    ask '确认删除选中的隧道和上述 DNS？输入 YES/y：'; confirmed || return 0
+    jq -r '.[].id' "$TMP/delete-selected.json" > "$TMP/delete-tunnel-ids"
+    while IFS= read -r delete_id; do
+        valid_uuid "$delete_id" || die 'Tunnel ID 格式错误。'
+        was_running=0
+        if [ "$delete_id" = "$local_tunnel_id" ]; then
+            control status >/dev/null 2>&1 && was_running=1
+            stop_if_running
+        fi
+        if ! api_request DELETE "/accounts/$account_id/cfd_tunnel/$delete_id" "$TMP/delete-result.json"; then
+            warn "隧道 $delete_id 删除失败，保留它的 DNS。若仍有连接器运行，请先停止后重试。"
+            [ "$was_running" != 1 ] || control start || true
+            continue
+        fi
+        if [ "$delete_id" = "$local_tunnel_id" ]; then sync_disable; fi
+        good "已删除 CF 隧道：$delete_id"
+        jq -r --arg t "$delete_id" '.[]|select(.tunnel_id == $t)|[.zone_id,.id]|@tsv' "$TMP/delete-dns.json" > "$TMP/delete-record-ids"
+        while IFS="$(printf '\t')" read -r delete_zone delete_record; do
+            # Recheck identity immediately before deleting DNS; never delete a reassigned record.
+            if api_request GET "/zones/$delete_zone/dns_records/$delete_record" "$TMP/dns-current.json" &&
+               jq -e --arg t "$delete_id.cfargotunnel.com" --arg z "$delete_zone" --arg d "$delete_record" --slurpfile before "$TMP/delete-dns.json" '.result as $r | $r.type == "CNAME" and ($r.content|ascii_downcase|rtrimstr(".")) == $t and any($before[0][]; .zone_id == $z and .id == $d and .name == $r.name)' "$TMP/dns-current.json" >/dev/null; then
+                api_request DELETE "/zones/$delete_zone/dns_records/$delete_record" "$TMP/dns-deleted.json" || warn "DNS $delete_record 删除失败，请手动检查。"
+            else warn "DNS $delete_record 已变化或无法读取，未删除。"; fi
+        done < "$TMP/delete-record-ids"
+    done < "$TMP/delete-tunnel-ids"
+}
+uninstall_menu() {
+    if [ -s "$APIBASE/auth.json" ]; then
+        dependencies; api_load_auth
+        TMP=$(mktemp -d); chmod 700 "$TMP"
+        api_current_tunnel
+        if api_collect "/accounts/$account_id/cfd_tunnel?is_deleted=false" "$TMP/delete-list.json"; then
+            jq '[.[]|select(.deleted_at == null)]' "$TMP/delete-list.json" > "$TMP/delete-active.json"
+        else
+            warn '无法读取 CF 隧道列表，仍可仅卸载本机隧道。'
+            printf '[]\n' > "$TMP/delete-active.json"
+        fi
+    else
+        TMP=$(mktemp -d); chmod 700 "$TMP"; local_tunnel_id=
+        printf '[]\n' > "$TMP/delete-active.json"
+        warn '尚未接入 API；只能卸载本机隧道。'
+    fi
+    printf '\n%s  【 卸载隧道 】%s\n' "$C_RED" "$C_RESET"; rule
+    # jq is not required for the original local-only uninstall.
+    delete_count=0
+    if [ -s "$APIBASE/auth.json" ]; then
+        delete_count=$(jq length "$TMP/delete-active.json")
+        jq -r --arg t "$local_tunnel_id" 'to_entries[]|"  \(.key+1). \(.value.name) · \(.value.id)" + (if .value.id == $t then " · 当前 VPS 使用" else "" end)' "$TMP/delete-active.json"
+    fi
+    printf '  输入编号删除；多个编号用空格分隔，例如 2 3。\n'
+    menu_item "$C_RED" 'A.' '删除列表中的全部 CF 隧道'
+    menu_item "$C_RED" 'L.' '仅卸载当前 VPS 隧道（原来的功能）'
+    menu_item "$C_DIM" '0.' '返回首页'
+    while :; do
+        ask '请选择编号 / A / L / 0：'
+        case "$REPLY" in
+            0) return;; L|l) uninstall; return;;
+            A|a) [ "$delete_count" -gt 0 ] || { warn '没有可删除的 CF 隧道。'; continue; }; cp "$TMP/delete-active.json" "$TMP/delete-selected.json"; break;;
+            *)
+                if ! printf '%s' "$REPLY" | grep -Eq '^[0-9]+( +[0-9]+)*$'; then warn '请输入有效编号，多个编号用空格分隔。'; continue; fi
+                valid_selection=1
+                for chosen in $REPLY; do
+                    case "$chosen" in 0*|??????????*) valid_selection=0;; *) [ "$chosen" -ge 1 ] && [ "$chosen" -le "$delete_count" ] || valid_selection=0;; esac
+                done
+                [ "$valid_selection" = 1 ] || { warn '请输入列表中的有效编号。'; continue; }
+                jq --arg choices "$REPLY" '($choices|split(" ")|map(select(length>0)|tonumber-1)|unique) as $n|[.[$n[]]]' "$TMP/delete-active.json" > "$TMP/delete-selected.json"
+                break;;
+        esac
+    done
+    api_delete_selected
+}
+
 api_check_access() {
     api_load_auth
     TMP=$(mktemp -d); chmod 700 "$TMP"
@@ -1489,20 +1588,20 @@ main() {
     while :; do
         header
         printf '\n%s  【 TUNNEL / 隧道管理 】%s\n' "$C_BLUE" "$C_RESET"
-        menu_item "$C_GREEN" '1.' '安装临时隧道（保活 + 开机自启）'
-        menu_item "$C_GREEN" '2.' '安装固定隧道（保活 + 开机自启）'
+        menu_item "$C_CYAN" '1.' '安装临时隧道（保活 + 开机自启）'
+        menu_item "$C_CYAN" '2.' '安装固定隧道（保活 + 开机自启）'
         menu_item "$C_BLUE" '3.' '查看隧道状态 / 域名'
         menu_item "$C_YELLOW" '4.' '重启隧道'
         menu_item "$C_YELLOW" '5.' '停止隧道'
         menu_item "$C_BLUE" '6.' '查看隧道日志'
         menu_item "$C_RED" '7.' '卸载隧道'
         printf '\n%s  【 NODE / 节点管理 】%s\n' "$C_PURPLE" "$C_RESET"
-        menu_item "$C_GREEN" '8.' '安装 / 切换节点核心'
+        menu_item "$C_CYAN" '8.' '安装 / 切换节点核心'
         menu_item "$C_BLUE" '9.' '查询节点信息 / 分享链接'
         menu_item "$C_YELLOW" '10.' '重启节点'
         menu_item "$C_YELLOW" '11.' '停止节点'
         menu_item "$C_BLUE" '12.' '查看节点日志'
-        menu_item "$C_GREEN" '13.' '更新节点核心'
+        menu_item "$C_CYAN" '13.' '更新节点核心'
         menu_item "$C_RED" '14.' '卸载节点核心'
         printf '\n%s  【 NETWORK / 网络设置 】%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
@@ -1515,7 +1614,7 @@ main() {
         case "$REPLY" in
             1) run_action setup quick;; 2) fixed_menu;; 3) run_action status;;
             4) if exists; then run_action control restart; else warn '尚未安装。'; fi;;
-            5) run_action stop_if_running;; 6) run_action logs;; 7) run_action uninstall;;
+            5) run_action stop_if_running;; 6) run_action logs;; 7) run_action uninstall_menu;;
             8) run_action node_menu;; 9) run_action node_info;;
             10) if node_exists; then run_action node_control restart; else warn '尚未安装节点。'; fi;;
             11) if node_exists; then run_action node_stop; else warn '尚未安装节点。'; fi;;
