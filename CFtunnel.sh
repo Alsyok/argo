@@ -29,7 +29,13 @@ cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap 'cleanup; terminal_restore' EXIT
 die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
-ask() { printf '  %s%s%s' "$C_CYAN" "${1#  }" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; REPLY=$(printf '%s' "$REPLY" | tr -d '\r'); }
+ask() {
+    ask_color=$C_CYAN
+    case "$1" in *YES/y*NO/n*) ask_color=$C_PURPLE;; esac
+    printf '  %s%s%s' "$ask_color" "${1#  }" "$C_RESET" >&2
+    IFS= read -r REPLY || exit 0
+    REPLY=$(printf '%s' "$REPLY" | tr -d '\r')
+}
 menu_item() { printf '  %s%3s%s  %s%s%s\n' "$C_WHITE" "$2" "$C_RESET" "$1" "$3" "$C_RESET"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
