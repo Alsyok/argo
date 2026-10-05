@@ -29,7 +29,7 @@ cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap 'cleanup; terminal_restore' EXIT
 die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
-ask() { printf '  %s%s%s' "$C_CYAN" "${1#  }" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; }
+ask() { printf '  %s%s%s' "$C_CYAN" "${1#  }" "$C_RESET" >&2; IFS= read -r REPLY || exit 0; REPLY=$(printf '%s' "$REPLY" | tr -d '\r'); }
 menu_item() { printf '  %s%3s%s  %s%s%s\n' "$C_WHITE" "$2" "$C_RESET" "$1" "$3" "$C_RESET"; }
 detect() {
     [ "$(id -u)" = 0 ] || die '请使用 root 运行。'
@@ -71,7 +71,7 @@ control() {
 }
 confirm_replace() {
     if exists; then
-        ask '已有本脚本管理的隧道。替换配置？输入 YES/y 确认：'
+        ask '已有本脚本管理的隧道。替换配置？输入 YES/y 继续，NO/n 取消：'
         confirmed || return 1
     fi
 }
@@ -249,7 +249,7 @@ stop_if_running() {
 }
 uninstall() {
     exists || { printf '尚未安装。\n'; return; }
-    ask '卸载本脚本的隧道、配置和日志？输入 YES/y 确认：'
+    ask '卸载本脚本的隧道、配置和日志？输入 YES/y 继续，NO/n 取消：'
     confirmed || return 0
     sync_remove
     stop_if_running
@@ -267,7 +267,17 @@ uninstall() {
     printf '已卸载。Cloudflare 后台的隧道和 DNS 记录需自行删除。\n'
 }
 
-confirmed() { case "$REPLY" in YES|yes|Y|y) return 0;; *) return 1;; esac; }
+confirmed() {
+    while :; do
+        confirm_reply=$(printf '%s' "$REPLY" | tr -d ' \t\r' | tr 'a-z' 'A-Z')
+        case "$confirm_reply" in
+            YES|Y) return 0;;
+            NO|N) return 1;;
+            *) warn '请输入 YES/y 继续，或 NO/n 取消。'
+               ask '输入 YES/y 继续，NO/n 取消：';;
+        esac
+    done
+}
 good() { printf '%s  ✓ %s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
 warn() { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
 rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"; }
@@ -727,7 +737,7 @@ update_node() {
 }
 remove_node() {
     node_exists || die '尚未安装节点。'
-    ask '删除节点核心、配置和保存的节点信息？输入 YES/y：'
+    ask '删除节点核心、配置和保存的节点信息？输入 YES/y 继续，NO/n 取消：'
     confirmed || return 0
     sync_disable
     node_stop
@@ -1069,7 +1079,7 @@ api_deploy() {
        [ "$uuid" = "$(cat "$NBASE/uuid")" ] && [ "$ws_path" = "$(cat "$NBASE/path")" ] &&
        [ "$core" = "$(cat "$NBASE/core")" ] && [ "$protocol" = "$(cat "$BASE/protocol")" ]; then
         if [ "$new_tunnel_name" != "$old_tunnel_name" ]; then
-            ask '应用隧道名称修改？输入 YES/y：'; confirmed || return 0
+            ask '应用隧道名称修改？输入 YES/y 继续，NO/n 取消：'; confirmed || return 0
             jq -n --arg n "$new_tunnel_name" '{name:$n}' > "$TMP/name-body.json"
             api_request PATCH "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-result.json" "$TMP/name-body.json" || die '修改隧道名称失败，请重新查看 CF 中的名称。'
             good "隧道名称已更新：$new_tunnel_name"
@@ -1094,7 +1104,7 @@ api_deploy() {
         die '原配置有多个入站，切换核心需先手动迁移其它入站；已取消。'
     fi
     rule; printf '  将部署：%s → http://127.0.0.1:%s\n  核心：%s · WS 路径：%s\n' "$domain" "$port" "$core" "$ws_path"
-    ask '应用以上配置？输入 YES/y：'; confirmed || return 0
+    ask '应用以上配置？输入 YES/y 继续，NO/n 取消：'; confirmed || return 0
     api_committed=0; api_local_changed=0; api_remote_changed=0; api_new_tunnel=0; api_dns_created=; api_name_changed=0
     api_snapshot
     trap api_rollback EXIT
@@ -1203,7 +1213,7 @@ api_delete_selected() {
     jq -r '.[]|"  · \(.name) → \(.content)"' "$TMP/delete-dns.json"
     [ "$(jq length "$TMP/delete-dns.json")" != 0 ] || printf '  （未找到关联 DNS）\n'
     warn '将删除选中的 CF 隧道和上述 DNS；权限范围外的 DNS 需自行检查。其它 VPS 若共用隧道也会受影响。'
-    ask '确认删除选中的隧道和上述 DNS？输入 YES/y：'; confirmed || return 0
+    ask '确认删除选中的隧道和上述 DNS？输入 YES/y 继续，NO/n 取消：'; confirmed || return 0
     jq -r '.[].id' "$TMP/delete-selected.json" > "$TMP/delete-tunnel-ids"
     while IFS= read -r delete_id; do
         valid_uuid "$delete_id" || die 'Tunnel ID 格式错误。'
