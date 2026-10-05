@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.2.0
+VERSION=2.3.0
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -195,6 +195,7 @@ setup() {
     fi
     read_protocol
     [ -x "$BIN" ] || download
+    sync_disable
     if exists; then stop_if_running; fi
     umask 077
     mkdir -p "$BASE/home"
@@ -248,6 +249,7 @@ uninstall() {
     exists || { printf '尚未安装。\n'; return; }
     ask '卸载本脚本的隧道、配置和日志？输入 YES/y 确认：'
     confirmed || return 0
+    sync_remove
     stop_if_running
     if [ "$MANAGER" = openrc ]; then
         rc-update del "$SERVICE" default
@@ -367,8 +369,10 @@ set_transport() {
 }
 node_exists() { [ -s "$NBASE/core" ] && [ -x "$NBIN" ]; }
 node_control() {
-    if [ "$MANAGER" = openrc ]; then rc-service "$NSERVICE" "$1"
-    else systemctl "$1" "$NSERVICE.service"; fi
+    if [ "$MANAGER" = openrc ]; then
+        rc-service "$NSERVICE" "$1" || return $?
+    else systemctl "$1" "$NSERVICE.service" || return $?; fi
+    case "$1" in start|restart) sync_stamp;; esac
 }
 node_stop() { if node_control status >/dev/null 2>&1; then node_control stop; fi; }
 node_service() {
@@ -550,7 +554,9 @@ install_node() {
         fi
     fi
     good '节点已启动，保活和开机自启已启用。'
+    sync_stamp
     node_info
+    sync_install
 }
 node_menu() {
     printf '\n%s  选择节点核心%s\n' "$C_CYAN" "$C_RESET"; rule
@@ -579,6 +585,13 @@ current_domain() {
 }
 node_info() {
     node_exists || die '尚未安装节点核心。'
+    if [ -x "$SYNCBIN" ] && [ "${api_local_changed:-0}" != 1 ]; then
+        if ! "$SYNCBIN" --once foreground; then
+            warn '自动同步未完成，保留上次有效节点信息。'
+            [ ! -s "$NBASE/node-info.txt" ] || cat "$NBASE/node-info.txt"
+            return 0
+        fi
+    fi
     command -v jq >/dev/null || dependencies
     core=$(cat "$NBASE/core"); uuid=$(cat "$NBASE/uuid")
     ws_path=$(cat "$NBASE/path"); port=$(cat "$NBASE/port")
@@ -702,6 +715,7 @@ remove_node() {
     node_exists || die '尚未安装节点。'
     ask '删除节点核心、配置和保存的节点信息？输入 YES/y：'
     confirmed || return 0
+    sync_disable
     node_stop
     if [ "$MANAGER" = openrc ]; then
         rc-update del "$NSERVICE" default
@@ -733,12 +747,672 @@ header() {
 }
 run_action() {
     # Keep operational failures inside a subshell, allowing return to the menu.
+    pause_owner=0
+    if [ -x "$SYNCBIN" ] && [ ! -f "$APIBASE/pause-pid" ]; then
+        mkdir -p "$APIBASE"; (umask 077; printf '%s\n' "$$" > "$APIBASE/pause-pid"); pause_owner=1
+    fi
     set +e
     (set -eu; trap cleanup EXIT; "$@")
     action_result=$?
+    if [ "$pause_owner" = 1 ]; then rm -f "$APIBASE/pause-pid"; fi
     set -e
     if [ "$action_result" -ne 0 ]; then warn '操作未完成，请查看上面的错误提示。'; fi
 }
+# API features are isolated from the original manual deployment functions.
+APIBASE=/etc/vps-cf-api
+SYNCBIN=/usr/local/lib/vps-cf-sync/run
+SYNCSERVICE=vps-cf-sync
+valid_uuid() { printf '%s\n' "$1" | grep -Eq '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$'; }
+valid_id() { printf '%s\n' "$1" | grep -Eq '^[a-fA-F0-9]{32}$'; }
+api_request() {
+    # Keep the credential out of process arguments and error output.
+    api_method=$1; api_path=$2; api_output=$3; api_body=${4:-}
+    api_headers=$(mktemp "$TMP/headers.XXXXXX")
+    chmod 600 "$api_headers"
+    printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$api_token" > "$api_headers"
+    if [ -n "$api_body" ]; then
+        api_http=$(curl -sS --connect-timeout 10 --max-time 30 -X "$api_method" -H "@$api_headers" --data-binary "@$api_body" -o "$api_output" -w '%{http_code}' "https://api.cloudflare.com/client/v4$api_path" 2>/dev/null) || api_http=000
+    else
+        api_http=$(curl -sS --connect-timeout 10 --max-time 30 -X "$api_method" -H "@$api_headers" -o "$api_output" -w '%{http_code}' "https://api.cloudflare.com/client/v4$api_path" 2>/dev/null) || api_http=000
+    fi
+    rm -f "$api_headers"
+    case "$api_http" in 2??) if jq -e '.success == true' "$api_output" >/dev/null 2>&1; then return 0; fi;; esac
+    api_codes=$(jq -r '[.errors[]?.code|tostring]|join(",")' "$api_output" 2>/dev/null || true)
+    warn "CF API 请求失败：HTTP $api_http${api_codes:+ / 错误码 $api_codes}。请检查网络、权限与参数。"
+    return 1
+}
+api_collect() {
+    # Pagination must not silently omit tunnels or zones.
+    list_path=$1; list_out=$2; list_page=1
+    printf '[]\n' > "$list_out"
+    while :; do
+        case "$list_path" in *\?*) list_sep='&';; *) list_sep='?';; esac
+        api_request GET "$list_path${list_sep}page=$list_page&per_page=50" "$TMP/list-page.json" || return 1
+        jq -e '.result|type == "array"' "$TMP/list-page.json" >/dev/null || return 1
+        jq -s '.[0] + .[1].result' "$list_out" "$TMP/list-page.json" > "$TMP/list-next.json"
+        mv "$TMP/list-next.json" "$list_out"
+        list_pages=$(jq -r '.result_info.total_pages // 1' "$TMP/list-page.json")
+        [ "$list_page" -lt "$list_pages" ] || break
+        list_page=$((list_page + 1))
+        [ "$list_page" -le 100 ] || { warn '列表超过 100 页，请限制 Token 的资源范围。'; return 1; }
+    done
+}
+api_load_auth() {
+    [ -s "$APIBASE/auth.json" ] || die '请先选择 1 · API 接入。'
+    api_token=$(jq -er '.token' "$APIBASE/auth.json")
+    account_id=$(jq -er '.account_id' "$APIBASE/auth.json")
+    zone_id=$(jq -er '.zone_id' "$APIBASE/auth.json")
+    zone_name=$(jq -er '.zone_name' "$APIBASE/auth.json")
+    valid_id "$account_id" && valid_id "$zone_id" || die '保存的 API 参数格式错误，请重新接入。'
+}
+api_read_id() {
+    while :; do
+        ask_form "$1"
+        id_value=${REPLY:-${2:-}}
+        if valid_id "$id_value"; then return; fi
+        warn '请输入 32 位账户或区域 ID。'
+    done
+}
+api_select_number() {
+    while :; do
+        ask "$1"
+        case "$REPLY" in ''|*[!0-9]*|??????*) warn '请输入列表中的序号。'; continue;; esac
+        selection=$(printf '%s' "$REPLY" | sed 's/^0*//'); selection=${selection:-0}
+        if [ "$selection" -ge 0 ] && [ "$selection" -le "$2" ]; then return; fi
+        warn '请输入列表中的序号。'
+    done
+}
+api_connect() {
+    dependencies
+    TMP=$(mktemp -d); chmod 700 "$TMP"
+    printf '\n%s  【 CF API 接入 】%s\n' "$C_CYAN" "$C_RESET"; rule
+    printf '  Token 权限：账户 Cloudflare Tunnel 编辑；区域 DNS 编辑、Zone 读取。\n'
+    printf '  API Token 与 Tunnel Token 不同；凭据只保存在本机，不上传仓库。\n'
+    old_account=$(jq -r '.account_id // empty' "$APIBASE/auth.json" 2>/dev/null || true)
+    while :; do
+        ask_form 'API Token（留空沿用已保存值）：'
+        api_token=$REPLY
+        if [ -z "$api_token" ]; then api_token=$(jq -r '.token // empty' "$APIBASE/auth.json" 2>/dev/null || true); fi
+        case "$api_token" in ''|*[!A-Za-z0-9_-]*) warn 'Token 为空或格式错误，请重新输入。'; continue;; esac
+        api_read_id "Account ID${old_account:+ [$old_account]}：" "$old_account"; account_id=$id_value
+        if api_collect "/accounts/$account_id/cfd_tunnel?is_deleted=false" "$TMP/tunnels.json"; then break; fi
+        warn '账户或隧道读取验证失败，请重新输入。'
+    done
+    while :; do
+        if api_collect "/zones?account.id=$account_id&status=active" "$TMP/zones.json"; then
+            jq -r 'to_entries[]|"  \(.key+1). \(.value.name)"' "$TMP/zones.json"
+            zone_count=$(jq 'length' "$TMP/zones.json")
+            if [ "$zone_count" -gt 0 ]; then
+                printf '  0. 手动输入 Zone ID\n'
+                api_select_number '选择域名区域：' "$zone_count"
+                if [ "$selection" -gt 0 ]; then zone_id=$(jq -r --argjson n "$selection" '.[$n-1].id' "$TMP/zones.json")
+                else api_read_id 'Zone ID：'; zone_id=$id_value; fi
+            else api_read_id '未找到可用区域，请输入 Zone ID：'; zone_id=$id_value; fi
+        else api_read_id '无法列出区域，请输入 Zone ID：'; zone_id=$id_value; fi
+        if api_request GET "/zones/$zone_id" "$TMP/zone.json" && jq -e --arg a "$account_id" '.result.account.id == $a and .result.status == "active"' "$TMP/zone.json" >/dev/null; then
+            zone_name=$(jq -er '.result.name' "$TMP/zone.json"); break
+        fi
+        warn '区域读取验证失败，或该区域不属于此账户，请重新选择。'
+    done
+    umask 077; mkdir -p "$APIBASE"; chmod 700 "$APIBASE"
+    jq -n --arg t "$api_token" --arg a "$account_id" --arg z "$zone_id" --arg n "$zone_name" '{token:$t,account_id:$a,zone_id:$z,zone_name:$n}' > "$APIBASE/auth.json.new"
+    mv "$APIBASE/auth.json.new" "$APIBASE/auth.json"
+    unset api_token REPLY
+    good "已保存凭据，账户与 $zone_name 的读取验证通过。"
+    printf '  写入权限将在实际部署时检查；权限不足会报错并尝试恢复。\n'
+}
+api_choose_tunnel() {
+    api_collect "/accounts/$account_id/cfd_tunnel?is_deleted=false" "$TMP/tunnels.json" || die '无法读取隧道列表。'
+    jq '[.[]|select(.config_src == "cloudflare" and .deleted_at == null)]' "$TMP/tunnels.json" > "$TMP/select-tunnels.json"
+    printf '\n'; jq -r 'to_entries[]|"  \(.key+1). \(.value.name) · \(.value.id)"' "$TMP/select-tunnels.json"
+    printf '  0. 新建隧道\n'
+    tunnel_count=$(jq 'length' "$TMP/select-tunnels.json")
+    api_select_number '选择已有隧道 / 0 新建：' "$tunnel_count"
+    if [ "$selection" -eq 0 ]; then
+        tunnel_id=; tunnel_name=
+        while :; do
+            ask_form '新隧道名称 [argo-node]：'; tunnel_name=${REPLY:-argo-node}
+            if [ "${#tunnel_name}" -le 100 ] && printf '%s' "$tunnel_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then break; fi
+            warn '名称请使用字母、数字、点、下划线或短横线。'
+        done
+    else tunnel_id=$(jq -r --argjson n "$selection" '.[$n-1].id' "$TMP/select-tunnels.json"); fi
+}
+api_read_parameters() {
+    previous_domain=${domain:-}
+    while :; do
+        ask_form "固定隧道子域名${previous_domain:+ [$previous_domain]}："
+        domain=$(printf '%s' "${REPLY:-$previous_domain}" | tr 'A-Z' 'a-z')
+        if valid_domain "$domain"; then
+            case "$domain" in *."$zone_name") break;; esac
+        fi
+        warn "请输入 $zone_name 下的完整子域名，例如 node.$zone_name。"
+    done
+    read_port "${port:-8080}"
+    path_default=${ws_path:-/argo}; read_path
+    uuid_default=${uuid:-$(cat /proc/sys/kernel/random/uuid)}
+    while :; do
+        ask_form "UUID [$uuid_default]："; uuid=${REPLY:-$uuid_default}
+        valid_uuid "$uuid" && break
+        warn 'UUID 格式错误，请重新输入。'
+    done
+    core_default=${core:-sing-box}
+    while :; do
+        ask_form "节点核心：1 sing-box / 2 Xray [当前 $core_default，留空保留]："
+        case "$REPLY" in '') core=$core_default; break;; 1) core=sing-box; break;; 2) core=xray; break;; *) warn '请输入 1 或 2。';; esac
+    done
+    protocol_default=$(cat "$BASE/protocol" 2>/dev/null || printf auto)
+    case "$protocol_default" in http2) protocol_choice=2;; quic) protocol_choice=3;; *) protocol_choice=1;; esac
+    while :; do
+        ask_form "隧道传输：1 自动 / 2 HTTP2 / 3 QUIC [$protocol_choice]："
+        case "${REPLY:-$protocol_choice}" in
+            1) protocol=auto; break;; 2) protocol=http2; break;; 3) protocol=quic; break;;
+            *) warn '请输入 1、2 或 3。';;
+        esac
+    done
+}
+api_config_body() {
+    # Preserve unrelated ingress and all origin settings. Refuse ambiguous path routes.
+    jq -e --arg h "$domain" --arg old "$old_hostname" '
+      [(.config.ingress // [])[]|select(.hostname == $h or ($old != "" and .hostname == $old))]
+      | length <= 1 and all(.[]; (.path // "") == "")
+    ' "$TMP/remote-before.json" >/dev/null || die '此域名存在多个路由或路径匹配规则，请先在 CF 后台整理后再部署。'
+    jq --arg h "$domain" --arg old "$old_hostname" --arg s "http://127.0.0.1:$port" '
+      (.config // {ingress:[{service:"http_status:404"}]}) as $c
+      | ($c.ingress // []) as $rules
+      | [$rules[]|select(.hostname == $h or ($old != "" and .hostname == $old))][0] as $existing
+      | ($rules | map(select(.hostname != $h and ($old == "" or .hostname != $old)))) as $other
+      | ($existing // {}) + {hostname:$h,service:$s} | del(.path) as $route
+      | {config:($c + {ingress:([$route] + $other)})}
+      | if (.config.ingress|any(.[]; (.hostname // "") == "" and (.path // "") == "")) then .
+        else .config.ingress += [{service:"http_status:404"}] end
+    ' "$TMP/remote-before.json" > "$TMP/remote-after.json"
+}
+api_service_path() {
+    if [ "$MANAGER" = openrc ]; then printf '/etc/init.d/%s' "$1"
+    else printf '/etc/systemd/system/%s.service' "$1"; fi
+}
+api_snapshot() {
+    [ ! -d "$BASE" ] || cp -a "$BASE" "$TMP/old-tunnel"
+    [ ! -d "$NBASE" ] || cp -a "$NBASE" "$TMP/old-node"
+    [ ! -f "$NBIN" ] || cp "$NBIN" "$TMP/old-core"
+    [ ! -f "$APIBASE/target.json" ] || cp "$APIBASE/target.json" "$TMP/old-target.json"
+    old_tunnel_running=0; old_node_running=0
+    control status >/dev/null 2>&1 && old_tunnel_running=1
+    node_control status >/dev/null 2>&1 && old_node_running=1
+    for snap_service in "$SERVICE" "$NSERVICE"; do
+        snap_path=$(api_service_path "$snap_service")
+        [ ! -f "$snap_path" ] || cp "$snap_path" "$TMP/$snap_service.service"
+        snap_enabled=0
+        if [ "$MANAGER" = systemd ]; then
+            systemctl is-enabled "$snap_service.service" >/dev/null 2>&1 && snap_enabled=1
+        elif rc-update show default 2>/dev/null | grep -q "^[[:space:]]*$snap_service[[:space:]]"; then snap_enabled=1; fi
+        printf '%s\n' "$snap_enabled" > "$TMP/$snap_service.enabled"
+    done
+}
+api_rollback() {
+    saved_status=$?
+    trap - EXIT INT TERM
+    set +e
+    if [ "${api_committed:-0}" != 1 ]; then
+        if [ "${api_local_changed:-0}" = 1 ]; then
+            warn '部署未完成，正在恢复本地隧道和节点。'
+            control stop >/dev/null 2>&1; node_control stop >/dev/null 2>&1
+            rm -rf "$BASE" "$NBASE"; rm -f "$NBIN"
+            [ ! -d "$TMP/old-tunnel" ] || cp -a "$TMP/old-tunnel" "$BASE"
+            [ ! -d "$TMP/old-node" ] || cp -a "$TMP/old-node" "$NBASE"
+            [ ! -f "$TMP/old-core" ] || { cp "$TMP/old-core" "$NBIN"; chmod 755 "$NBIN"; }
+            for restore_service in "$SERVICE" "$NSERVICE"; do
+                restore_path=$(api_service_path "$restore_service")
+                if [ -f "$TMP/$restore_service.service" ]; then cp "$TMP/$restore_service.service" "$restore_path"
+                else rm -f "$restore_path"; fi
+                restore_enabled=$(cat "$TMP/$restore_service.enabled")
+                if [ "$MANAGER" = openrc ]; then
+                    if [ "$restore_enabled" = 1 ]; then rc-update add "$restore_service" default >/dev/null 2>&1
+                    else rc-update del "$restore_service" default >/dev/null 2>&1; fi
+                fi
+            done
+            if [ "$MANAGER" = systemd ]; then
+                systemctl daemon-reload
+                for restore_service in "$SERVICE" "$NSERVICE"; do
+                    if [ "$(cat "$TMP/$restore_service.enabled")" = 1 ]; then systemctl enable "$restore_service.service" >/dev/null 2>&1
+                    else systemctl disable "$restore_service.service" >/dev/null 2>&1; fi
+                done
+            fi
+            [ "$old_tunnel_running" != 1 ] || control start >/dev/null 2>&1
+            [ "$old_node_running" != 1 ] || node_control start >/dev/null 2>&1
+            rm -f "$APIBASE/target.json"
+            [ ! -f "$TMP/old-target.json" ] || cp "$TMP/old-target.json" "$APIBASE/target.json"
+        fi
+        if [ "${api_remote_changed:-0}" = 1 ] && [ "${api_new_tunnel:-0}" != 1 ]; then
+            expected_remote="$TMP/remote-after.json"
+            [ ! -s "$TMP/remote-applied.json" ] || expected_remote="$TMP/remote-applied.json"
+            if api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/rollback-current.json" &&
+               [ "$(jq -cS '.result.config' "$TMP/rollback-current.json")" = "$(jq -cS '.config' "$expected_remote")" ]; then
+                jq '{config:.config}' "$TMP/remote-before.json" > "$TMP/rollback-body.json"
+                api_request PUT "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/rollback-result.json" "$TMP/rollback-body.json" || warn 'CF 路由恢复失败，请在后台检查。'
+            else warn 'CF 配置已被其它操作修改或无法读取，未覆盖它；请检查后台路由。'; fi
+        fi
+        if [ "${api_dns_created:-}" != '' ]; then
+            if api_request GET "/zones/$zone_id/dns_records/$api_dns_created" "$TMP/rollback-dns.json" &&
+               jq -e --arg h "$domain" --arg t "$tunnel_id.cfargotunnel.com" '.result.name == $h and .result.type == "CNAME" and .result.content == $t' "$TMP/rollback-dns.json" >/dev/null; then
+                api_request DELETE "/zones/$zone_id/dns_records/$api_dns_created" "$TMP/delete-dns.json" || warn '新建 DNS 清理失败，请在后台检查。'
+            fi
+        fi
+        if [ "${api_new_tunnel:-0}" = 1 ]; then
+            api_request DELETE "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/delete-tunnel.json" || warn "新建隧道清理失败，请检查 $tunnel_id。"
+        fi
+    fi
+    cleanup
+    exit "$saved_status"
+}
+api_deploy() {
+    api_edit=$1
+    api_load_auth
+    dependencies
+    [ -x "$BIN" ] || download
+    TMP=$(mktemp -d); chmod 700 "$TMP"
+    old_hostname=; domain=; port=8080; ws_path=/argo; uuid=; core=sing-box
+    if node_exists; then
+        core=$(cat "$NBASE/core"); uuid=$(cat "$NBASE/uuid"); port=$(cat "$NBASE/port"); ws_path=$(cat "$NBASE/path")
+    fi
+    if [ "$api_edit" = edit ]; then
+        [ -s "$APIBASE/target.json" ] || die '尚无 API 部署记录，请先自动部署。'
+        jq -e --arg a "$account_id" '.account_id == $a' "$APIBASE/target.json" >/dev/null || die '保存的部署属于其它账户，请切换 API 凭据。'
+        tunnel_id=$(jq -er '.tunnel_id' "$APIBASE/target.json")
+        domain=$(cat "$BASE/domain"); old_hostname=$domain
+        zone_id=$(jq -er '.zone_id' "$APIBASE/target.json")
+        zone_name=$(jq -er '.zone_name' "$APIBASE/target.json")
+        printf '  修改当前部署：%s\n' "$domain"
+    else
+        api_choose_tunnel
+        if [ -s "$BASE/domain" ]; then domain=$(cat "$BASE/domain"); fi
+    fi
+    api_read_parameters
+    if [ -s "$BASE/metrics-port" ] && [ "$(cat "$BASE/metrics-port")" = "$port" ]; then die '节点端口与隧道监控端口冲突，请换一个端口。'; fi
+    if port_busy "$port"; then
+        node_exists && node_control status >/dev/null 2>&1 && [ "$(cat "$NBASE/port")" = "$port" ] || die "端口 $port 被其它服务占用。"
+    fi
+    if node_exists && [ "$(cat "$NBASE/core")" = "$core" ]; then
+        cp "$NBIN" "$TMP/core"; chmod 755 "$TMP/core"; core_version=$(cat "$NBASE/version")
+    else fetch_core; fi
+    # Preserve unrelated local inbounds if the core is unchanged.
+    build_config
+    if node_exists && [ "$(cat "$NBASE/core")" = "$core" ]; then
+        jq -e '[.inbounds[]?|select(.tag == "vless-ws")]|length == 1' "$NBASE/config.json" >/dev/null || die '找不到唯一的 vless-ws 入站，未覆盖手动配置。'
+        jq -s '.[0] as $old | .[1].inbounds[0] as $new | $old | .inbounds |= map(if .tag == "vless-ws" then $new else . end)' "$NBASE/config.json" "$TMP/config.json" > "$TMP/merged.json"
+        mv "$TMP/merged.json" "$TMP/config.json"
+        if [ "$core" = sing-box ]; then "$TMP/core" check -c "$TMP/config.json"; else "$TMP/core" run -test -config "$TMP/config.json"; fi
+    elif node_exists && [ "$(jq '.inbounds|length' "$NBASE/config.json")" -gt 1 ]; then
+        die '原配置有多个入站，切换核心需先手动迁移其它入站；已取消。'
+    fi
+    rule; printf '  将部署：%s → http://127.0.0.1:%s\n  核心：%s · WS 路径：%s\n' "$domain" "$port" "$core" "$ws_path"
+    ask '应用以上配置？输入 YES/y：'; confirmed || return 0
+    api_committed=0; api_local_changed=0; api_remote_changed=0; api_new_tunnel=0; api_dns_created=
+    api_snapshot
+    trap api_rollback EXIT
+    trap 'exit 130' INT; trap 'exit 143' TERM
+    if [ -z "$tunnel_id" ]; then
+        jq -n --arg n "$tunnel_name" '{name:$n,config_src:"cloudflare"}' > "$TMP/create.json"
+        api_request POST "/accounts/$account_id/cfd_tunnel" "$TMP/created.json" "$TMP/create.json" || die '创建隧道失败。'
+        tunnel_id=$(jq -er '.result.id' "$TMP/created.json"); api_new_tunnel=1
+    fi
+    valid_uuid "$tunnel_id" || die 'Tunnel ID 格式错误。'
+    api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/tunnel.json" || die '读取隧道失败。'
+    jq -e '.result.config_src == "cloudflare"' "$TMP/tunnel.json" >/dev/null || die '只支持 CF 后台管理的隧道。'
+    api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id/token" "$TMP/token.json" || die '无法获取 Tunnel Token，请检查隧道编辑权限。'
+    token=$(jq -er '.result | select(type == "string" and length > 0)' "$TMP/token.json")
+    if [ "$api_new_tunnel" = 1 ]; then
+        printf '{"config":null}\n' > "$TMP/remote-before.json"
+    else
+        api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/remote.json" || die '读取路由失败。'
+        jq '.result' "$TMP/remote.json" > "$TMP/remote-before.json"
+    fi
+    api_config_body
+    api_request GET "/zones/$zone_id/dns_records?name=$domain&per_page=100" "$TMP/dns.json" || die '读取 DNS 失败。'
+    dns_count=$(jq '.result|length' "$TMP/dns.json")
+    if [ "$dns_count" -gt 0 ]; then
+        jq -e --arg t "$tunnel_id.cfargotunnel.com" '.result|length == 1 and .[0].type == "CNAME" and .[0].content == $t and .[0].proxied == true' "$TMP/dns.json" >/dev/null || die '域名已有其它 DNS 记录或未开启代理；为避免覆盖，请先处理冲突。'
+        dns_id=$(jq -er '.result[0].id' "$TMP/dns.json")
+    else
+        jq -n --arg h "$domain" --arg t "$tunnel_id.cfargotunnel.com" '{type:"CNAME",name:$h,content:$t,proxied:true,ttl:1}' > "$TMP/dns-body.json"
+        api_request POST "/zones/$zone_id/dns_records" "$TMP/dns-new.json" "$TMP/dns-body.json" || die '创建 DNS 失败，请检查 DNS 编辑权限。'
+        dns_id=$(jq -er '.result.id' "$TMP/dns-new.json"); api_dns_created=$dns_id
+    fi
+    # Fetch again before PUT to avoid knowingly overwriting concurrent dashboard edits.
+    if [ "$api_new_tunnel" != 1 ]; then
+        api_request GET "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/remote-check.json" || die '提交前读取路由失败。'
+        [ "$(jq -cS '.result.config' "$TMP/remote-check.json")" = "$(jq -cS '.config' "$TMP/remote-before.json")" ] || die 'CF 路由刚被修改，请重新操作。'
+    fi
+    api_remote_changed=1
+    api_request PUT "/accounts/$account_id/cfd_tunnel/$tunnel_id/configurations" "$TMP/remote-result.json" "$TMP/remote-after.json" || die '更新路由失败。'
+    # Use CF's normalized response when deciding whether rollback is still safe.
+    if jq -e '.result.config|type == "object"' "$TMP/remote-result.json" >/dev/null; then
+        jq '{config:.result.config}' "$TMP/remote-result.json" > "$TMP/remote-applied.json"
+    fi
+    api_local_changed=1
+    stop_if_running; node_stop
+    umask 077; mkdir -p "$BASE/home" "$NBASE" /usr/local/lib/vps-node /var/log/vps-tunnel "$APIBASE"
+    chmod 700 "$BASE" "$BASE/home" "$NBASE" /usr/local/lib/vps-node "$APIBASE"
+    printf '%s\n' fixed > "$BASE/mode"; printf '%s\n' "$domain" > "$BASE/domain"
+    printf '%s\n' "$token" > "$BASE/token"; unset token REPLY
+    printf '%s\n' "$port" > "$BASE/port"; printf '%s\n' "$ws_path" > "$BASE/ws-path"
+    printf '%s\n' "$protocol" > "$BASE/protocol"; rm -f "$BASE/effective-protocol" "$BASE/domain-cache"
+    choose_metrics; write_runner; write_service
+    cp "$TMP/core" "$NBIN"; chmod 755 "$NBIN"
+    cp "$TMP/config.json" "$NBASE/config.json"
+    printf '%s\n' "$core" > "$NBASE/core"; printf '%s\n' "$core_version" > "$NBASE/version"
+    printf '%s\n' "$uuid" > "$NBASE/uuid"; printf '%s\n' "$ws_path" > "$NBASE/path"; printf '%s\n' "$port" > "$NBASE/port"
+    node_service; node_control start; control start
+    count=0
+    while [ "$count" -lt 10 ]; do
+        if node_control status >/dev/null 2>&1 && port_busy "$port"; then break; fi
+        sleep 1; count=$((count + 1))
+    done
+    [ "$count" -lt 10 ] || die '节点未成功监听。'
+    wait_connected || die '隧道连接未成功，正在恢复旧配置。'
+    jq -n --arg a "$account_id" --arg t "$tunnel_id" --arg z "$zone_id" --arg zn "$zone_name" --arg h "$domain" --arg s "http://127.0.0.1:$port" --arg d "$dns_id" '{account_id:$a,tunnel_id:$t,zone_id:$z,zone_name:$zn,hostname:$h,service:$s,dns_id:$d}' > "$APIBASE/target.json.new"
+    mv "$APIBASE/target.json.new" "$APIBASE/target.json"
+    sync_stamp
+    node_info
+    api_committed=1
+    sync_install
+    good 'API 配置已应用；节点信息后台同步已启用（每 60 秒）。'
+    if [ -n "$old_hostname" ] && [ "$old_hostname" != "$domain" ]; then
+        printf '  旧域名 %s 的 DNS 保留，确认不再需要后可在 CF 后台删除。\n' "$old_hostname"
+    fi
+}
+api_menu() {
+    while :; do
+        printf '\n%s  【 CF API 模式 】%s\n' "$C_CYAN" "$C_RESET"; rule
+        menu_item "$C_GREEN" '1.' 'API 接入'
+        menu_item "$C_GREEN" '2.' '自动部署'
+        menu_item "$C_YELLOW" '3.' '修改配置'
+        menu_item "$C_DIM" '0.' '返回上一级'
+        ask '请选择 [0–3]：'
+        case "$REPLY" in
+            1) run_action api_connect;;
+            2) run_action api_deploy deploy; API_DONE=1; return;;
+            3) run_action api_deploy edit; API_DONE=1; return;;
+            0) return;; *) warn '请输入 0、1、2 或 3。';;
+        esac
+        # Results remain visible until the user returns to this submenu.
+    done
+}
+fixed_menu() {
+    while :; do
+        printf '\n%s  【 固定隧道安装模式 】%s\n' "$C_CYAN" "$C_RESET"; rule
+        menu_item "$C_GREEN" '1.' '手动模式'
+        menu_item "$C_GREEN" '2.' 'API 接入模式'
+        menu_item "$C_DIM" '0.' '返回首页'
+        ask '请选择 [0–2]：'
+        case "$REPLY" in 1) run_action setup fixed; return;; 2) API_DONE=0; api_menu; [ "$API_DONE" != 1 ] || return;; 0) return;; *) warn '请输入 0、1 或 2。';; esac
+    done
+}
+
+write_sync_program() {
+    cat > "$SYNCBIN.new" <<'SYNC_WORKER'
+#!/bin/sh
+# Read-only synchronizer. It never writes CF or restarts node/tunnel services.
+set -eu
+BASE=/etc/vps-tunnel
+NBASE=/etc/vps-node
+NBIN=/usr/local/lib/vps-node/core
+APIBASE=/etc/vps-cf-api
+LOG=/var/log/vps-tunnel/cloudflared.log
+WORK=
+LOCK=/run/vps-cf-sync.lock
+cleanup_sync() {
+    [ -z "$WORK" ] || rm -rf "$WORK"
+    if [ -d "$LOCK" ] && [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$$" ]; then rm -rf "$LOCK"; fi
+}
+trap cleanup_sync EXIT
+trap 'exit 0' INT TERM
+fail() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
+atomic_text() { printf '%s\n' "$2" > "$1.new"; mv "$1.new" "$1"; }
+valid_domain() { [ "${#1}" -le 253 ] && printf '%s\n' "$1" | grep -Eq '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$'; }
+api_get() {
+    curl -fsS --connect-timeout 5 --max-time 15 -H "@$WORK/headers" "https://api.cloudflare.com/client/v4$1" -o "$2" 2>/dev/null || return 1
+    jq -e '.success == true' "$2" >/dev/null 2>&1
+}
+running() {
+    if command -v rc-service >/dev/null 2>&1; then rc-service "$1" status >/dev/null 2>&1
+    else systemctl is-active --quiet "$1.service"; fi
+}
+listen_port() {
+    hex=$(printf '%04X' "$1")
+    awk -v p="$hex" '$4 == "0A" {split($2,a,":"); if (toupper(a[length(a)]) == p) ok=1} END {exit !ok}' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+read_node() {
+    core=$(cat "$NBASE/core")
+    cp "$NBASE/config.json" "$WORK/config.json"
+    if [ "$core" = sing-box ]; then
+        "$NBIN" check -c "$WORK/config.json" >/dev/null 2>&1 || fail '核心配置校验失败，保留旧链接。'
+        jq -e '[.inbounds[]?|select(.tag == "vless-ws" and .type == "vless" and .listen == "127.0.0.1" and .transport.type == "ws" and (.tls.enabled // false) == false)]
+          | select(length == 1) | .[0] | select(.users|length == 1)
+          | {uuid:.users[0].uuid,path:.transport.path,port:.listen_port}' "$WORK/config.json" > "$WORK/node.json" || fail '无法识别唯一的 VLESS WS 入站，保留旧链接。'
+    elif [ "$core" = xray ]; then
+        "$NBIN" run -test -config "$WORK/config.json" >/dev/null 2>&1 || fail '核心配置校验失败，保留旧链接。'
+        jq -e '[.inbounds[]?|select(.tag == "vless-ws" and .protocol == "vless" and .listen == "127.0.0.1" and .streamSettings.network == "ws" and (.streamSettings.security // "none") == "none")]
+          | select(length == 1) | .[0] | select(.settings.clients|length == 1)
+          | {uuid:.settings.clients[0].id,path:.streamSettings.wsSettings.path,port:.port}' "$WORK/config.json" > "$WORK/node.json" || fail '无法识别唯一的 VLESS WS 入站，保留旧链接。'
+    else fail '未知节点核心，保留旧链接。'; fi
+    jq -e '.uuid|type == "string"' "$WORK/node.json" >/dev/null || fail 'UUID 类型错误。'
+    uuid=$(jq -r '.uuid' "$WORK/node.json"); ws_path=$(jq -r '.path' "$WORK/node.json"); port=$(jq -r '.port' "$WORK/node.json")
+    printf '%s' "$uuid" | grep -Eq '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$' || fail 'UUID 格式错误。'
+    [ "${#ws_path}" -le 128 ] && printf '%s' "$ws_path" | grep -Eq '^/[A-Za-z0-9/._~-]*$' || fail 'WS 路径格式错误。'
+    case "$port" in ''|*[!0-9]*|??????*) fail '端口格式错误。';; esac
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || fail '端口范围错误。'
+    running vps-node && listen_port "$port" || fail '节点未运行或未监听新端口，保留旧链接。'
+    # Restart through the manager after editing. A new hash cannot prove a live reload.
+    config_sha=$(sha256sum "$WORK/config.json" | awk '{print $1}')
+    if [ "$config_sha" != "$(cat "$NBASE/active-config-sha" 2>/dev/null || true)" ]; then
+        fail '磁盘配置尚未确认已由核心加载；请选择 10 重启节点，再自动同步。'
+    fi
+}
+read_domain() {
+    mode=$(cat "$BASE/mode")
+    running vps-tunnel || fail '隧道已停止，保留旧链接。'
+    case "$mode" in
+      quick)
+        domain=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG" 2>/dev/null | tail -n 1 || true)
+        domain=${domain#https://}
+        [ "$(cat "$BASE/port")" = "$port" ] || fail '临时隧道端口与核心不一致，保留旧链接。'
+        ;;
+      fixed)
+        if [ -s "$APIBASE/target.json" ]; then
+            cp "$APIBASE/target.json" "$WORK/target.json"
+            a=$(jq -er '.account_id' "$WORK/target.json"); t=$(jq -er '.tunnel_id' "$WORK/target.json")
+            z=$(jq -er '.zone_id' "$WORK/target.json"); old=$(jq -er '.hostname' "$WORK/target.json")
+            svc=$(jq -er '.service' "$WORK/target.json")
+            jq -e --arg a "$a" '.account_id == $a' "$APIBASE/auth.json" >/dev/null || fail 'API 凭据账户不匹配。'
+            token=$(jq -er '.token' "$APIBASE/auth.json")
+            printf 'Authorization: Bearer %s\n' "$token" > "$WORK/headers"; unset token
+            api_get "/accounts/$a/cfd_tunnel/$t/configurations" "$WORK/remote.json" || fail 'CF API 读取失败，保留旧链接。'
+            jq --arg h "$old" --arg s "$svc" '
+              [.result.config.ingress[]?|select(.hostname != null and (.path // "") == "")] as $r
+              | [$r[]|select(.hostname == $h)] as $same
+              | if ($same|length) == 1 then $same
+                elif ($same|length) == 0 then [$r[]|select(.service == $s)] else [] end
+              | select(length == 1) | .[0]
+            ' "$WORK/remote.json" > "$WORK/route.json"
+            [ -s "$WORK/route.json" ] || fail '路由被删除或有多个候选域名，无法安全识别；请重新选择 API 部署。'
+            domain=$(jq -er '.hostname' "$WORK/route.json")
+            remote_service=$(jq -er '.service' "$WORK/route.json")
+            case "$remote_service" in "http://127.0.0.1:$port"|"http://localhost:$port") :;; *) fail 'CF 服务地址与本地 WS 监听不一致，请通过修改配置处理。';; esac
+            zn=$(jq -er '.zone_name' "$WORK/target.json")
+            case "$domain" in *."$zn") :;; *) fail '新域名不属于选定区域，保留旧链接。';; esac
+            api_get "/zones/$z/dns_records?name=$domain&per_page=100" "$WORK/dns.json" || fail '域名 DNS 读取失败。'
+            jq -e --arg t "$t.cfargotunnel.com" '.result|length == 1 and .[0].type == "CNAME" and .[0].content == $t and .[0].proxied == true' "$WORK/dns.json" >/dev/null || fail '域名 DNS 未正确指向此隧道，保留旧链接。'
+            dns=$(jq -er '.result[0].id' "$WORK/dns.json")
+            jq --arg h "$domain" --arg s "$remote_service" --arg d "$dns" '.hostname=$h | .service=$s | .dns_id=$d' "$WORK/target.json" > "$WORK/new-target.json"
+        else
+            domain=$(cat "$BASE/domain")
+            [ "$(cat "$BASE/port")" = "$port" ] || fail '手动固定隧道端口记录与核心不一致，请同步 CF 路由和本地记录。'
+        fi
+        ;;
+      *) fail '未知隧道模式。';;
+    esac
+    valid_domain "$domain" || fail '未找到有效域名，保留旧链接。'
+    [ -s "$BASE/metrics-port" ] || fail '缺少隧道就绪检查端口。'
+    curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:$(cat "$BASE/metrics-port")/ready" >/dev/null 2>&1 || fail '隧道尚未连接，保留旧链接。'
+}
+sync_once() {
+    sync_foreground=${1:-}
+    umask 077
+    if [ -f "$APIBASE/pause-pid" ] && [ "${1:-}" != foreground ]; then
+        pause_pid=$(cat "$APIBASE/pause-pid")
+        if kill -0 "$pause_pid" 2>/dev/null; then exit 0; fi
+        rm -f "$APIBASE/pause-pid"
+    fi
+    mkdir "$LOCK" 2>/dev/null || {
+        lock_pid=$(cat "$LOCK/pid" 2>/dev/null || true)
+        case "$lock_pid" in
+          ''|*[!0-9]*)
+            lock_time=$(stat -c %Y "$LOCK" 2>/dev/null || date +%s)
+            [ "$(( $(date +%s) - lock_time ))" -ge 30 ] || exit 0
+            ;;
+          *) if kill -0 "$lock_pid" 2>/dev/null; then exit 0; fi;;
+        esac
+        rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || exit 0
+    }
+    printf '%s\n' "$$" > "$LOCK/pid"
+    [ -s "$NBASE/config.json" ] && [ -x "$NBIN" ] && [ -s "$BASE/mode" ] || exit 0
+    WORK=$(mktemp -d)
+    read_node; read_domain
+    flag=🌐; name=未知
+    code=$(cat "$NBASE/country-code" 2>/dev/null || true)
+    if printf '%s' "$code" | grep -Eq '^[A-Z]{2}$'; then
+        flag=$(jq -nr --arg c "$code" '$c|explode|map(.+127397)|implode')
+        name=$(cat "$NBASE/country-name" 2>/dev/null || printf '%s' "$code")
+    fi
+    case "$core" in sing-box) label="Argo-singbox-$flag";; *) label="Argo-Xray-$flag";; esac
+    encoded_label=$(jq -nr --arg s "$label" '$s|@uri'); encoded_path=$(jq -nr --arg s "$ws_path" '$s|@uri')
+    link="vless://$uuid@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&host=$domain&path=$encoded_path#$encoded_label"
+    version=$(cat "$NBASE/version")
+    printf '%s\n' "$link" > "$WORK/node-link.txt"
+    {
+      printf '节点名称：%s\n出口地区：%s\n\n' "$label" "$name"
+      printf '核心：%s %s\n' "$core" "$version"
+      printf '域名：%s\n客户端端口：443\n本地监听：127.0.0.1:%s\n' "$domain" "$port"
+      printf '协议：VLESS\nUUID：%s\n传输：WebSocket\nWS 路径：%s\n' "$uuid" "$ws_path"
+      printf '客户端 TLS：开启\nSNI / WS Host：%s\n本地 TLS：关闭\n\n%s\n' "$domain" "$link"
+    } > "$WORK/node-info.txt"
+    # Ensure the config did not change while network requests were in progress.
+    [ "$config_sha" = "$(sha256sum "$NBASE/config.json" | awk '{print $1}')" ] || fail '检查期间核心配置变化，下次重试。'
+    if [ -f "$APIBASE/pause-pid" ] && [ "$sync_foreground" != foreground ]; then
+        pause_pid=$(cat "$APIBASE/pause-pid")
+        if kill -0 "$pause_pid" 2>/dev/null; then exit 0; fi
+    fi
+    if [ -f "$WORK/target.json" ] && ! cmp -s "$WORK/target.json" "$APIBASE/target.json"; then
+        fail '检查期间部署目标变化，下次重试。'
+    fi
+    changed=0
+    for file in node-info.txt node-link.txt; do
+        if ! cmp -s "$WORK/$file" "$NBASE/$file"; then
+            cp "$WORK/$file" "$NBASE/$file.new"; mv "$NBASE/$file.new" "$NBASE/$file"; changed=1
+        fi
+    done
+    for field in uuid path port; do
+        case "$field" in uuid) value=$uuid;; path) value=$ws_path;; port) value=$port;; esac
+        if [ "$(cat "$NBASE/$field" 2>/dev/null || true)" != "$value" ]; then atomic_text "$NBASE/$field" "$value"; fi
+    done
+    if [ "$(cat "$BASE/port")" != "$port" ]; then atomic_text "$BASE/port" "$port"; fi
+    if [ "$(cat "$BASE/ws-path" 2>/dev/null || true)" != "$ws_path" ]; then atomic_text "$BASE/ws-path" "$ws_path"; fi
+    if [ "$mode" = fixed ] && [ -f "$WORK/new-target.json" ]; then
+        if ! cmp -s "$WORK/new-target.json" "$APIBASE/target.json"; then cp "$WORK/new-target.json" "$APIBASE/target.json.new"; mv "$APIBASE/target.json.new" "$APIBASE/target.json"; fi
+        if [ "$(cat "$BASE/domain")" != "$domain" ]; then atomic_text "$BASE/domain" "$domain"; fi
+    fi
+    if [ "$changed" = 1 ]; then
+        printf '%s 已更新节点信息：%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$domain"
+        atomic_text "$APIBASE/last-sync" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
+}
+case "${1:-}" in
+  --once) sync_once "${2:-}";;
+  *)
+    child=
+    trap '[ -z "$child" ] || kill "$child" 2>/dev/null || true; exit 0' INT TERM
+    while :; do
+        "$0" --once & child=$!
+        wait "$child" || true; child=
+        sleep 60 & child=$!
+        wait "$child" || true; child=
+    done
+    ;;
+esac
+SYNC_WORKER
+    chmod 700 "$SYNCBIN.new"
+    mv "$SYNCBIN.new" "$SYNCBIN"
+}
+sync_control() {
+    if [ "$MANAGER" = openrc ]; then rc-service "$SYNCSERVICE" "$1"
+    else systemctl "$1" "$SYNCSERVICE.service"; fi
+}
+sync_disable() {
+    if [ -x "$SYNCBIN" ]; then
+        sync_control stop >/dev/null 2>&1 || true
+        if [ "$MANAGER" = openrc ]; then rc-update del "$SYNCSERVICE" default >/dev/null 2>&1 || true
+        else systemctl disable "$SYNCSERVICE.service" >/dev/null 2>&1 || true; fi
+    fi
+    rm -f "$APIBASE/target.json"
+}
+sync_remove() {
+    sync_disable
+    if [ "$MANAGER" = openrc ]; then rm -f /etc/init.d/vps-cf-sync
+    else rm -f /etc/systemd/system/vps-cf-sync.service; systemctl daemon-reload; fi
+    rm -rf /usr/local/lib/vps-cf-sync "$APIBASE"
+    rm -f /var/log/vps-cf-sync.log
+}
+sync_install() {
+    umask 077
+    mkdir -p /usr/local/lib/vps-cf-sync "$APIBASE"
+    chmod 700 /usr/local/lib/vps-cf-sync "$APIBASE"
+    write_sync_program
+    if [ "$MANAGER" = openrc ]; then
+        cat > /etc/init.d/vps-cf-sync <<'RC'
+#!/sbin/openrc-run
+name="Argo node information synchronizer"
+supervisor="supervise-daemon"
+command="/usr/local/lib/vps-cf-sync/run"
+respawn_delay=5
+respawn_max=0
+respawn_period=60
+output_log="/var/log/vps-cf-sync.log"
+error_log="/var/log/vps-cf-sync.log"
+depend() { need net; after vps-tunnel vps-node; }
+RC
+        chmod 755 /etc/init.d/vps-cf-sync
+        rc-update add "$SYNCSERVICE" default
+    else
+        cat > /etc/systemd/system/vps-cf-sync.service <<'UNIT'
+[Unit]
+Description=Argo node information synchronizer
+Wants=network-online.target
+After=network-online.target vps-tunnel.service vps-node.service
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/vps-cf-sync/run
+Restart=always
+RestartSec=5
+UMask=0077
+StandardOutput=append:/var/log/vps-cf-sync.log
+StandardError=append:/var/log/vps-cf-sync.log
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable "$SYNCSERVICE.service"
+    fi
+    sync_control restart || die '节点已部署，但后台同步服务启动失败，请查看 vps-cf-sync 日志。'
+}
+sync_stamp() {
+    # Called only after the node manager successfully starts/restarts the core.
+    if [ -s "$NBASE/config.json" ]; then
+        (umask 077; sha256sum "$NBASE/config.json" | awk '{print $1}' > "$NBASE/active-config-sha.new"; mv "$NBASE/active-config-sha.new" "$NBASE/active-config-sha")
+    fi
+}
+
 main() {
     detect
     terminal_enter
@@ -770,7 +1444,7 @@ main() {
             case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15) break;; *) warn '请输入 0–15，重新选择即可。';; esac
         done
         case "$REPLY" in
-            1) run_action setup quick;; 2) run_action setup fixed;; 3) run_action status;;
+            1) run_action setup quick;; 2) fixed_menu;; 3) run_action status;;
             4) if exists; then run_action control restart; else warn '尚未安装。'; fi;;
             5) run_action stop_if_running;; 6) run_action logs;; 7) run_action uninstall;;
             8) run_action node_menu;; 9) run_action node_info;;
