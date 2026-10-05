@@ -71,7 +71,7 @@ control() {
 }
 confirm_replace() {
     if exists; then
-        ask '已有本脚本管理的隧道。替换配置？输入 YES/y 继续，NO/n 取消：'
+        ask '已有本脚本管理的隧道。替换配置？输入 “YES/y” 继续，“NO/n” 取消：'
         confirmed || return 1
     fi
 }
@@ -190,7 +190,7 @@ setup() {
             ask_form '粘贴 Tunnel Token（只粘贴 Token，不要整条命令）：'
             token=$REPLY
             case "$token" in
-                ''|*[!A-Za-z0-9_+/=-]*) warn 'Token 为空或字符格式错误，请重新输入。';;
+                ''|*[!A-Za-z0-9_+/=-]*) retry_input 'Token 为空或字符格式错误，请重新输入。';;
                 *) break;;
             esac
         done
@@ -249,7 +249,7 @@ stop_if_running() {
 }
 uninstall() {
     exists || { printf '尚未安装。\n'; return; }
-    ask '卸载本脚本的隧道、配置和日志？输入 YES/y 继续，NO/n 取消：'
+    ask '卸载本脚本的隧道、配置和日志？输入 “YES/y” 继续，“NO/n” 取消：'
     confirmed || return 0
     sync_remove
     stop_if_running
@@ -273,22 +273,23 @@ confirmed() {
         case "$confirm_reply" in
             YES|Y) return 0;;
             NO|N) return 1;;
-            *) warn '请输入 YES/y 继续，或 NO/n 取消。'
-               ask '输入 YES/y 继续，NO/n 取消：';;
+            *) retry_input '请输入 “YES/y” 继续，或 “NO/n” 取消。'
+               ask '输入 “YES/y” 继续，“NO/n” 取消：';;
         esac
     done
 }
 good() { printf '%s  ✓ %s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
-warn() { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+warn() { printf '%s  ⚠ %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+retry_input() { printf '%s  ↻ %s%s\n' "$C_PURPLE" "$*" "$C_RESET" >&2; }
 rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"; }
 read_port() {
     while :; do
         ask_form "本地 WS 端口 [$1]："
         port=${REPLY:-$1}
-        case "$port" in ''|*[!0-9]*|??????*) warn '请输入 1–65535。'; continue;; esac
+        case "$port" in ''|*[!0-9]*|??????*) retry_input '请输入 1–65535。'; continue;; esac
         port=$(printf '%s' "$port" | sed 's/^0*//'); port=${port:-0}
         if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then return; fi
-        warn '请输入 1–65535。'
+        retry_input '请输入 1–65535。'
     done
 }
 valid_domain() {
@@ -299,7 +300,7 @@ read_domain() {
         ask_form '固定隧道域名（不含 https:// 和路径）：'
         domain=$REPLY
         if valid_domain "$domain"; then return; fi
-        warn '请输入完整域名，例如 node.example.com。'
+        retry_input '请输入完整域名，例如 node.example.com。'
     done
 }
 read_path() {
@@ -307,13 +308,13 @@ read_path() {
         ask_form "本地 WebSocket 路径 [${path_default:-/argo}]："
         ws_path=${REPLY:-${path_default:-/argo}}
         if [ "${#ws_path}" -le 128 ] && printf '%s\n' "$ws_path" | grep -Eq '^/[A-Za-z0-9/._~-]*$'; then return; fi
-        warn '路径需以 / 开头，使用字母、数字或 / . _ ~ -，请重新输入。'
+        retry_input '路径需以 / 开头，使用字母、数字或 / . _ ~ -，请重新输入。'
     done
 }
 read_protocol() {
     while :; do
         ask_form '隧道传输：1 自动 / 2 HTTP2（禁 UDP 时选） / 3 QUIC [1]：'
-        case "${REPLY:-1}" in 1) protocol=auto; return;; 2) protocol=http2; return;; 3) protocol=quic; return;; *) warn '请输入 1、2 或 3。';; esac
+        case "${REPLY:-1}" in 1) protocol=auto; return;; 2) protocol=http2; return;; 3) protocol=quic; return;; *) retry_input '请输入 1、2 或 3。';; esac
     done
 }
 port_busy() {
@@ -497,7 +498,7 @@ install_node() {
         menu_item "$C_DIM" '0.' '取消'
         while :; do
             ask '请选择 [0–2]：'
-            case "$REPLY" in 1) break;; 2) edit_node=1; break;; 0) return;; *) warn '请输入 0、1 或 2。';; esac
+            case "$REPLY" in 1) break;; 2) edit_node=1; break;; 0) return;; *) retry_input '请输入 0、1 或 2。';; esac
         done
     fi
     dependencies
@@ -510,7 +511,7 @@ install_node() {
                 ask_form "UUID [$original_uuid]："
                 uuid=${REPLY:-$original_uuid}
                 if printf '%s\n' "$uuid" | grep -Eq '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$'; then break; fi
-                warn 'UUID 格式错误，请重新输入。'
+                retry_input 'UUID 格式错误，请重新输入。'
             done
             path_default=$ws_path
             read_path
@@ -577,7 +578,7 @@ node_menu() {
     menu_item "$C_DIM" '0.' '返回'
     while :; do
         ask '请选择 [0–2]：'
-        case "$REPLY" in 1) install_node sing-box; return;; 2) install_node xray; return;; 0) return;; *) warn '请选择 0、1 或 2。';; esac
+        case "$REPLY" in 1) install_node sing-box; return;; 2) install_node xray; return;; 0) return;; *) retry_input '请选择 0、1 或 2。';; esac
     done
 }
 current_domain() {
@@ -728,7 +729,7 @@ finish_screen() {
     menu_item "$C_DIM" '0.' '退出脚本'
     while :; do
         ask '请选择 [0–1]：'
-        case "$REPLY" in 1) return;; 0) exit 0;; *) warn '请输入 0 或 1。';; esac
+        case "$REPLY" in 1) return;; 0) exit 0;; *) retry_input '请输入 0 或 1。';; esac
     done
 }
 update_node() {
@@ -737,7 +738,7 @@ update_node() {
 }
 remove_node() {
     node_exists || die '尚未安装节点。'
-    ask '删除节点核心、配置和保存的节点信息？输入 YES/y 继续，NO/n 取消：'
+    ask '删除节点核心、配置和保存的节点信息？输入 “YES/y” 继续，“NO/n” 取消：'
     confirmed || return 0
     sync_disable
     node_stop
@@ -834,16 +835,16 @@ api_read_id() {
         ask_form "$1"
         id_value=${REPLY:-${2:-}}
         if valid_id "$id_value"; then return; fi
-        warn '请输入 32 位账户或区域 ID。'
+        retry_input '请输入 32 位账户或区域 ID。'
     done
 }
 api_select_number() {
     while :; do
         ask "$1"
-        case "$REPLY" in ''|*[!0-9]*|??????*) warn '请输入列表中的序号。'; continue;; esac
+        case "$REPLY" in ''|*[!0-9]*|??????*) retry_input '请输入列表中的序号。'; continue;; esac
         selection=$(printf '%s' "$REPLY" | sed 's/^0*//'); selection=${selection:-0}
         if [ "$selection" -ge 0 ] && [ "$selection" -le "$2" ]; then return; fi
-        warn '请输入列表中的序号。'
+        retry_input '请输入列表中的序号。'
     done
 }
 api_connect() {
@@ -857,10 +858,10 @@ api_connect() {
         ask_form 'API Token（留空沿用已保存值）：'
         api_token=$REPLY
         if [ -z "$api_token" ]; then api_token=$(jq -r '.token // empty' "$APIBASE/auth.json" 2>/dev/null || true); fi
-        case "$api_token" in ''|*[!A-Za-z0-9_-]*) warn 'Token 为空或格式错误，请重新输入。'; continue;; esac
+        case "$api_token" in ''|*[!A-Za-z0-9_-]*) retry_input 'Token 为空或格式错误，请重新输入。'; continue;; esac
         api_read_id "Account ID${old_account:+ [$old_account]}：" "$old_account"; account_id=$id_value
         if api_collect "/accounts/$account_id/cfd_tunnel?is_deleted=false" "$TMP/tunnels.json"; then break; fi
-        warn '账户或隧道读取验证失败，请重新输入。'
+        retry_input '账户或隧道读取验证失败，请重新输入。'
     done
     while :; do
         if api_collect "/zones?account.id=$account_id&status=active" "$TMP/zones.json"; then
@@ -876,7 +877,7 @@ api_connect() {
         if api_request GET "/zones/$zone_id" "$TMP/zone.json" && jq -e --arg a "$account_id" '.result.account.id == $a and .result.status == "active"' "$TMP/zone.json" >/dev/null; then
             zone_name=$(jq -er '.result.name' "$TMP/zone.json"); break
         fi
-        warn '区域读取验证失败，或该区域不属于此账户，请重新选择。'
+        retry_input '区域读取验证失败，或该区域不属于此账户，请重新选择。'
     done
     umask 077; mkdir -p "$APIBASE"; chmod 700 "$APIBASE"
     jq -n --arg t "$api_token" --arg a "$account_id" --arg z "$zone_id" --arg n "$zone_name" '{token:$t,account_id:$a,zone_id:$z,zone_name:$n}' > "$APIBASE/auth.json.new"
@@ -897,7 +898,7 @@ api_choose_tunnel() {
         while :; do
             ask_form '新隧道名称 [argo-node]：'; tunnel_name=${REPLY:-argo-node}
             if [ "${#tunnel_name}" -le 100 ] && printf '%s' "$tunnel_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then break; fi
-            warn '名称请使用字母、数字、点、下划线或短横线。'
+            retry_input '名称请使用字母、数字、点、下划线或短横线。'
         done
     else tunnel_id=$(jq -r --argjson n "$selection" '.[$n-1].id' "$TMP/select-tunnels.json"); fi
 }
@@ -909,7 +910,7 @@ api_read_parameters() {
         if valid_domain "$domain"; then
             case "$domain" in *."$zone_name") break;; esac
         fi
-        warn "请输入 $zone_name 下的完整子域名，例如 node.$zone_name。"
+        retry_input "请输入 $zone_name 下的完整子域名，例如 node.$zone_name。"
     done
     read_port "${port:-8080}"
     path_default=${ws_path:-/argo}; read_path
@@ -917,12 +918,12 @@ api_read_parameters() {
     while :; do
         ask_form "UUID [$uuid_default]："; uuid=${REPLY:-$uuid_default}
         valid_uuid "$uuid" && break
-        warn 'UUID 格式错误，请重新输入。'
+        retry_input 'UUID 格式错误，请重新输入。'
     done
     core_default=${core:-sing-box}
     while :; do
         ask_form "节点核心：1 sing-box / 2 Xray [当前 $core_default，留空保留]："
-        case "$REPLY" in '') core=$core_default; break;; 1) core=sing-box; break;; 2) core=xray; break;; *) warn '请输入 1 或 2。';; esac
+        case "$REPLY" in '') core=$core_default; break;; 1) core=sing-box; break;; 2) core=xray; break;; *) retry_input '请输入 1 或 2。';; esac
     done
     protocol_default=$(cat "$BASE/protocol" 2>/dev/null || printf auto)
     case "$protocol_default" in http2) protocol_choice=2;; quic) protocol_choice=3;; *) protocol_choice=1;; esac
@@ -930,7 +931,7 @@ api_read_parameters() {
         ask_form "隧道传输：1 自动 / 2 HTTP2 / 3 QUIC [$protocol_choice]："
         case "${REPLY:-$protocol_choice}" in
             1) protocol=auto; break;; 2) protocol=http2; break;; 3) protocol=quic; break;;
-            *) warn '请输入 1、2 或 3。';;
+            *) retry_input '请输入 1、2 或 3。';;
         esac
     done
 }
@@ -1069,7 +1070,7 @@ api_deploy() {
             new_tunnel_name=${REPLY:-$old_tunnel_name}
             [ -n "$REPLY" ] || break
             if [ "${#new_tunnel_name}" -le 100 ] && printf '%s' "$new_tunnel_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then break; fi
-            warn '名称请使用字母、数字、点、下划线或短横线（最多 100 字符）。'
+            retry_input '名称请使用字母、数字、点、下划线或短横线（最多 100 字符）。'
         done
     fi
     api_read_parameters
@@ -1079,7 +1080,7 @@ api_deploy() {
        [ "$uuid" = "$(cat "$NBASE/uuid")" ] && [ "$ws_path" = "$(cat "$NBASE/path")" ] &&
        [ "$core" = "$(cat "$NBASE/core")" ] && [ "$protocol" = "$(cat "$BASE/protocol")" ]; then
         if [ "$new_tunnel_name" != "$old_tunnel_name" ]; then
-            ask '应用隧道名称修改？输入 YES/y 继续，NO/n 取消：'; confirmed || return 0
+            ask '应用隧道名称修改？输入 “YES/y” 继续，“NO/n” 取消：'; confirmed || return 0
             jq -n --arg n "$new_tunnel_name" '{name:$n}' > "$TMP/name-body.json"
             api_request PATCH "/accounts/$account_id/cfd_tunnel/$tunnel_id" "$TMP/name-result.json" "$TMP/name-body.json" || die '修改隧道名称失败，请重新查看 CF 中的名称。'
             good "隧道名称已更新：$new_tunnel_name"
@@ -1104,7 +1105,7 @@ api_deploy() {
         die '原配置有多个入站，切换核心需先手动迁移其它入站；已取消。'
     fi
     rule; printf '  将部署：%s → http://127.0.0.1:%s\n  核心：%s · WS 路径：%s\n' "$domain" "$port" "$core" "$ws_path"
-    ask '应用以上配置？输入 YES/y 继续，NO/n 取消：'; confirmed || return 0
+    ask '应用以上配置？输入 “YES/y” 继续，“NO/n” 取消：'; confirmed || return 0
     api_committed=0; api_local_changed=0; api_remote_changed=0; api_new_tunnel=0; api_dns_created=; api_name_changed=0
     api_snapshot
     trap api_rollback EXIT
@@ -1213,7 +1214,7 @@ api_delete_selected() {
     jq -r '.[]|"  · \(.name) → \(.content)"' "$TMP/delete-dns.json"
     [ "$(jq length "$TMP/delete-dns.json")" != 0 ] || printf '  （未找到关联 DNS）\n'
     warn '将删除选中的 CF 隧道和上述 DNS；权限范围外的 DNS 需自行检查。其它 VPS 若共用隧道也会受影响。'
-    ask '确认删除选中的隧道和上述 DNS？输入 YES/y 继续，NO/n 取消：'; confirmed || return 0
+    ask '确认删除选中的隧道和上述 DNS？输入 “YES/y” 继续，“NO/n” 取消：'; confirmed || return 0
     jq -r '.[].id' "$TMP/delete-selected.json" > "$TMP/delete-tunnel-ids"
     while IFS= read -r delete_id; do
         valid_uuid "$delete_id" || die 'Tunnel ID 格式错误。'
@@ -1272,12 +1273,12 @@ uninstall_menu() {
             0) return;; L|l) uninstall; return;;
             A|a) [ "$delete_count" -gt 0 ] || { warn '没有可删除的 CF 隧道。'; continue; }; cp "$TMP/delete-active.json" "$TMP/delete-selected.json"; break;;
             *)
-                if ! printf '%s' "$REPLY" | grep -Eq '^[0-9]+( +[0-9]+)*$'; then warn '请输入列表中的编号，多个编号用空格分隔后回车，例如 1 2。'; continue; fi
+                if ! printf '%s' "$REPLY" | grep -Eq '^[0-9]+( +[0-9]+)*$'; then retry_input '请输入列表中的编号，多个编号用空格分隔后回车，例如 1 2。'; continue; fi
                 valid_selection=1
                 for chosen in $REPLY; do
                     case "$chosen" in 0*|??????????*) valid_selection=0;; *) [ "$chosen" -ge 1 ] && [ "$chosen" -le "$delete_count" ] || valid_selection=0;; esac
                 done
-                [ "$valid_selection" = 1 ] || { warn '请输入列表中的有效编号。'; continue; }
+                [ "$valid_selection" = 1 ] || { retry_input '请输入列表中的有效编号。'; continue; }
                 jq --arg choices "$REPLY" '($choices|split(" ")|map(select(length>0)|tonumber-1)|unique) as $n|[.[$n[]]]' "$TMP/delete-active.json" > "$TMP/delete-selected.json"
                 break;;
         esac
@@ -1312,7 +1313,7 @@ api_menu() {
             1) run_action api_deploy deploy; API_DONE=1; return;;
             2) run_action api_deploy edit; API_DONE=1; return;;
             3) run_action api_connect;;
-            0) return;; *) warn '请输入 0、1、2 或 3。';;
+            0) return;; *) retry_input '请输入 0、1、2 或 3。';;
         esac
     done
 }
@@ -1323,7 +1324,7 @@ fixed_menu() {
         menu_item "$C_GREEN" '2.' 'API 接入模式'
         menu_item "$C_DIM" '0.' '返回首页'
         ask '请选择 [0–2]：'
-        case "$REPLY" in 1) run_action setup fixed; return;; 2) API_DONE=0; api_menu; [ "$API_DONE" != 1 ] || return;; 0) return;; *) warn '请输入 0、1 或 2。';; esac
+        case "$REPLY" in 1) run_action setup fixed; return;; 2) API_DONE=0; api_menu; [ "$API_DONE" != 1 ] || return;; 0) return;; *) retry_input '请输入 0、1 或 2。';; esac
     done
 }
 
@@ -1619,7 +1620,7 @@ main() {
         rule
         while :; do
             ask '  请选择 [0–15]：'
-            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15) break;; *) warn '请输入 0–15，重新选择即可。';; esac
+            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15) break;; *) retry_input '请输入 0–15，重新选择即可。';; esac
         done
         case "$REPLY" in
             1) run_action setup quick;; 2) fixed_menu;; 3) run_action status;;
@@ -1629,7 +1630,7 @@ main() {
             10) if node_exists; then run_action node_control restart; else warn '尚未安装节点。'; fi;;
             11) if node_exists; then run_action node_stop; else warn '尚未安装节点。'; fi;;
             12) run_action node_logs;; 13) run_action update_node;; 14) run_action remove_node;;
-            15) run_action set_transport;; 0) exit 0;; *) warn '请输入正确选项。';;
+            15) run_action set_transport;; 0) exit 0;; *) retry_input '请输入正确选项。';;
         esac
         finish_screen
         clear_screen
