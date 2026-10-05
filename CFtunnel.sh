@@ -1252,17 +1252,17 @@ uninstall_menu() {
         delete_count=$(jq length "$TMP/delete-active.json")
         jq -r --arg t "$local_tunnel_id" 'to_entries[]|"  \(.key+1). \(.value.name) · \(.value.id)" + (if .value.id == $t then " · 当前 VPS 使用" else "" end)' "$TMP/delete-active.json"
     fi
-    printf '  输入编号删除；多个编号用空格分隔，例如 2 3。\n'
-    menu_item "$C_RED" 'A.' '删除列表中的全部 CF 隧道'
-    menu_item "$C_RED" 'L.' '仅卸载当前 VPS 隧道（原来的功能）'
+    printf '  输入编号删除；多个编号用空格分隔，后回车。例如 2 3。\n'
+    menu_item "$C_RED" 'A.' '删除上面列出的所有 CF 隧道'
+    menu_item "$C_RED" 'L.' '保留 CF 后台配置，仅卸载本机隧道'
     menu_item "$C_DIM" '0.' '返回首页'
     while :; do
-        ask '请选择编号 / A / L / 0：'
+        ask '请输入隧道编号（可多个），或 A / L / 0：'
         case "$REPLY" in
             0) return;; L|l) uninstall; return;;
             A|a) [ "$delete_count" -gt 0 ] || { warn '没有可删除的 CF 隧道。'; continue; }; cp "$TMP/delete-active.json" "$TMP/delete-selected.json"; break;;
             *)
-                if ! printf '%s' "$REPLY" | grep -Eq '^[0-9]+( +[0-9]+)*$'; then warn '请输入有效编号，多个编号用空格分隔。'; continue; fi
+                if ! printf '%s' "$REPLY" | grep -Eq '^[0-9]+( +[0-9]+)*$'; then warn '请输入列表中的编号，多个编号用空格分隔后回车，例如 1 2。'; continue; fi
                 valid_selection=1
                 for chosen in $REPLY; do
                     case "$chosen" in 0*|??????????*) valid_selection=0;; *) [ "$chosen" -ge 1 ] && [ "$chosen" -le "$delete_count" ] || valid_selection=0;; esac
