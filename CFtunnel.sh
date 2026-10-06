@@ -13,7 +13,7 @@ NSERVICE=vps-node
 NLOG=/var/log/vps-node.log
 RAW=https://raw.githubusercontent.com/Alsyok/argo/cores
 SCREEN_ACTIVE=0
-C_ERROR= C_WARNING= C_RETRY= C_LINE= C_LINK= C_INSTALL= C_PROMPT= C_BLUE= C_PURPLE= C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
+C_STATUS_LINE= C_ERROR= C_WARNING= C_RETRY= C_LINE= C_LINK= C_INSTALL= C_PROMPT= C_BLUE= C_PURPLE= C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
     C_RESET=$(printf '\033[0m')
     C_CYAN=$(printf '\033[38;2;129;206;214m')
@@ -28,6 +28,7 @@ if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
     C_WARNING=$(printf '\033[38;2;229;192;123m')
     C_RETRY=$(printf '\033[38;2;192;132;252m')
     C_LINE=$(printf '\033[38;2;82;103;124m')
+    C_STATUS_LINE=$(printf '\033[38;2;97;175;239m')
     C_LINK=$(printf '\033[38;2;255;250;205m')
     C_INSTALL=$(printf '\033[38;2;144;238;144m')
     C_PROMPT=$(printf '\033[38;2;154;205;50m')
@@ -55,7 +56,7 @@ print_prompt_defaults() {
 ask() {
     ask_base_color=$C_CYAN
     case "${1#  }" in
-        '请选择 [0–15]：'|'已有本脚本管理的隧道。替换配置？'*|'本地 WS 端口 '*|'本地 WebSocket 路径 '*) ask_base_color=$C_PROMPT;;
+        '请选择 [0–16]：'|'已有本脚本管理的隧道。替换配置？'*|'本地 WS 端口 '*|'本地 WebSocket 路径 '*) ask_base_color=$C_PROMPT;;
     esac
     case "$1" in
         *'输入 “YES/y” 继续，“NO/n” 取消：'*)
@@ -319,7 +320,7 @@ warn() { printf '%s  ⚠ %s%s\n' "$C_WARNING" "$*" "$C_RESET" >&2; }
 retry_input() { printf '%s  ↻ %s%s\n' "$C_RETRY" "$*" "$C_RESET" >&2; }
 rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_LINE" "$C_RESET"; }
 status_rule() {
-    printf '%s  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄%s\n' "$C_LINE" "$C_RESET"
+    printf '%s  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄%s\n' "$C_STATUS_LINE" "$C_RESET"
 }
 read_port() {
     while :; do
@@ -1631,6 +1632,133 @@ sync_stamp() {
     fi
 }
 
+bbr_read() { sysctl -n "$1" 2>/dev/null; }
+bbr_supported() {
+    bbr_available=$(bbr_read net.ipv4.tcp_available_congestion_control || true)
+    case " $bbr_available " in *' bbr '*) return 0;; *) return 1;; esac
+}
+bbr_status() {
+    printf '\n%s  【 BBR 管理 】%s\n' "$C_CYAN" "$C_RESET"; rule
+    printf '  内核：%s\n' "$(uname -r)"
+    bbr_current=$(bbr_read net.ipv4.tcp_congestion_control || printf 无法读取)
+    printf '  当前拥塞控制：%s%s%s\n' "$C_PURPLE" "$bbr_current" "$C_RESET"
+    if bbr_supported; then good '内核已提供 BBR。'
+    else warn '当前未发现 BBR；开启时会尝试加载内核模块。'; fi
+    printf '  默认队列规则：%s%s%s\n' "$C_PURPLE" "$(bbr_read net.core.default_qdisc || printf 无法读取)" "$C_RESET"
+    if [ -s /etc/sysctl.d/99-zz-argo-bbr.conf ]; then
+        printf '  %s已保存开机参数。%s\n' "$C_GREEN" "$C_RESET"
+    fi
+}
+bbr_restore() {
+    bbr_exit=$?
+    trap - EXIT INT TERM
+    set +e
+    if [ "${bbr_committed:-0}" != 1 ]; then
+        if [ "${bbr_runtime_changed:-0}" = 1 ]; then
+            sysctl -w "net.ipv4.tcp_congestion_control=$bbr_old_cc" >/dev/null 2>&1 || warn '拥塞控制恢复失败，请检查系统参数。'
+            [ -z "$bbr_old_qdisc" ] || sysctl -w "net.core.default_qdisc=$bbr_old_qdisc" >/dev/null 2>&1 || warn '默认队列恢复失败，请检查系统参数。'
+        fi
+        if [ "${bbr_files_changed:-0}" = 1 ]; then
+            for bbr_file in "$bbr_sysfile" "$bbr_modfile"; do
+                bbr_basename=$(basename "$bbr_file")
+                if [ -f "$TMP/$bbr_basename.old" ]; then cp -p "$TMP/$bbr_basename.old" "$bbr_file"
+                else rm -f "$bbr_file"; fi
+            done
+        fi
+        if [ "$MANAGER" = openrc ]; then
+            [ "${bbr_added_modules:-0}" != 1 ] || rc-update del modules boot >/dev/null 2>&1
+            [ "${bbr_added_sysctl:-0}" != 1 ] || rc-update del sysctl boot >/dev/null 2>&1
+        fi
+    fi
+    cleanup
+    exit "$bbr_exit"
+}
+bbr_enable() {
+    command -v sysctl >/dev/null 2>&1 || die '系统缺少 sysctl，无法设置 BBR。'
+    bbr_old_cc=$(bbr_read net.ipv4.tcp_congestion_control) || die '无法读取 TCP 拥塞控制参数。'
+    bbr_old_qdisc=$(bbr_read net.core.default_qdisc || true)
+    ask '开启 BBR 并保存开机参数？输入 “YES/y” 继续，“NO/n” 取消：'
+    confirmed || return 0
+    if ! bbr_supported; then
+        if command -v modprobe >/dev/null 2>&1; then modprobe tcp_bbr 2>/dev/null || true; fi
+        bbr_supported || die '当前内核不支持 BBR，或容器不允许加载模块；未修改参数。请使用宿主机提供的内核支持。'
+    fi
+    [ -z "$bbr_old_qdisc" ] || { command -v modprobe >/dev/null 2>&1 && modprobe sch_fq 2>/dev/null || true; }
+    bbr_sysfile=/etc/sysctl.d/99-zz-argo-bbr.conf
+    if [ "$MANAGER" = openrc ]; then
+        [ -f /etc/init.d/sysctl ] && [ -f /etc/init.d/modules ] || die '缺少 OpenRC sysctl/modules 服务，无法保证开机应用。'
+        bbr_modfile=/etc/modules
+    else bbr_modfile=/etc/modules-load.d/argo-bbr.conf; fi
+    # Only these two owned/preserved files and the two sysctl keys are changed.
+    TMP=$(mktemp -d); chmod 700 "$TMP"
+    bbr_committed=0; bbr_runtime_changed=0; bbr_files_changed=0
+    bbr_added_modules=0; bbr_added_sysctl=0
+    for bbr_file in "$bbr_sysfile" "$bbr_modfile"; do
+        [ ! -L "$bbr_file" ] || die 'BBR 参数文件是符号链接，未覆盖它。'
+        [ ! -f "$bbr_file" ] || cp -p "$bbr_file" "$TMP/$(basename "$bbr_file").old"
+    done
+    trap bbr_restore EXIT
+    trap 'exit 130' INT; trap 'exit 143' TERM
+    bbr_runtime_changed=1
+    # Test effective writes first; a restricted container must not receive a success message.
+    if [ -n "$bbr_old_qdisc" ]; then
+        sysctl -w net.core.default_qdisc=fq >/dev/null || die '默认队列写入被拒绝，正在恢复原设置。'
+        [ "$(bbr_read net.core.default_qdisc)" = fq ] || die '默认队列验证失败，正在恢复原设置。'
+    else warn '当前环境没有默认队列参数，将仅开启 TCP BBR。'; fi
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null || die 'BBR 写入被拒绝；容器可能没有权限，正在恢复原设置。'
+    [ "$(bbr_read net.ipv4.tcp_congestion_control)" = bbr ] || die 'BBR 验证失败，正在恢复原设置。'
+    {
+        printf '# Managed by ARGO BBR menu\n'
+        [ -z "$bbr_old_qdisc" ] || printf 'net.core.default_qdisc = fq\n'
+        printf 'net.ipv4.tcp_congestion_control = bbr\n'
+    } > "$TMP/sysctl.new"
+    if [ "$MANAGER" = openrc ]; then
+        if [ -f "$bbr_modfile" ]; then cp -p "$bbr_modfile" "$TMP/modules.new"
+        else : > "$TMP/modules.new"; fi
+        for bbr_module in tcp_bbr sch_fq; do
+            [ "$bbr_module" != sch_fq ] || [ -n "$bbr_old_qdisc" ] || continue
+            grep -Eq "^[[:space:]]*$bbr_module([[:space:]]|$)" "$TMP/modules.new" || printf '\n%s\n' "$bbr_module" >> "$TMP/modules.new"
+        done
+    else
+        printf '# Managed by ARGO BBR menu\ntcp_bbr\n' > "$TMP/modules.new"
+        [ -z "$bbr_old_qdisc" ] || printf 'sch_fq\n' >> "$TMP/modules.new"
+    fi
+    mkdir -p /etc/sysctl.d "$(dirname "$bbr_modfile")"
+    bbr_files_changed=1
+    # Stage in the destination directory so replacement is atomic on that filesystem.
+    cp "$TMP/sysctl.new" "$bbr_sysfile.new"; chmod 644 "$bbr_sysfile.new"; mv "$bbr_sysfile.new" "$bbr_sysfile"
+    cp "$TMP/modules.new" "$bbr_modfile.new"; chmod 644 "$bbr_modfile.new"; mv "$bbr_modfile.new" "$bbr_modfile"
+    if [ "$MANAGER" = openrc ]; then
+        for bbr_service in modules sysctl; do
+            if ! rc-update show boot 2>/dev/null | grep -q "^[[:space:]]*$bbr_service[[:space:]]"; then
+                case "$bbr_service" in modules) bbr_added_modules=1;; sysctl) bbr_added_sysctl=1;; esac
+                rc-update add "$bbr_service" boot || die '开机服务设置失败，正在恢复原设置。'
+            fi
+        done
+    fi
+    bbr_committed=1
+    good 'BBR 已开启，开机参数已保存。'
+    printf '  %sBBR 作用于新建 TCP 连接；QUIC 使用 UDP，不受此设置控制。%s\n' "$C_DIM" "$C_RESET"
+    if [ -n "$bbr_old_qdisc" ]; then
+        printf '  %s默认队列已设置 fq；现有网卡队列未强制替换，不一定立即变化。%s\n' "$C_DIM" "$C_RESET"
+    fi
+}
+bbr_menu() {
+    while :; do
+        bbr_status
+        menu_item "$C_INSTALL" '1.' '开启 BBR（保存开机参数）'
+        menu_item "$C_BLUE" '2.' '查看状态'
+        menu_item "$C_DIM" '0.' '返回首页'
+        ask '请选择 [0–2]：'
+        case "$REPLY" in
+            1) run_action bbr_enable;;
+            2) :;;
+            0) return;;
+            *) retry_input '请输入 0、1 或 2。';;
+        esac
+    done
+}
+
 main() {
     detect
     terminal_enter
@@ -1655,11 +1783,12 @@ main() {
         menu_item "$C_RED" '14.' '卸载节点核心'
         printf '\n%s  【 NETWORK / 网络设置 】%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
+        menu_item "$C_INSTALL" '16.' 'BBR 管理'
         menu_item "$C_DIM" '0.' '退出'
         rule
         while :; do
-            ask '  请选择 [0–15]：'
-            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15) break;; *) retry_input '请输入 0–15，重新选择即可。';; esac
+            ask '  请选择 [0–16]：'
+            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16) break;; *) retry_input '请输入 0–16，重新选择即可。';; esac
         done
         case "$REPLY" in
             1) run_action setup quick;; 2) fixed_menu;; 3) run_action status;;
@@ -1669,7 +1798,7 @@ main() {
             10) if node_exists; then run_action node_control restart; else warn '尚未安装节点。'; fi;;
             11) if node_exists; then run_action node_stop; else warn '尚未安装节点。'; fi;;
             12) run_action node_logs;; 13) run_action update_node;; 14) run_action remove_node;;
-            15) run_action set_transport;; 0) exit 0;; *) retry_input '请输入正确选项。';;
+            15) run_action set_transport;; 16) bbr_menu;; 0) exit 0;; *) retry_input '请输入正确选项。';;
         esac
         finish_screen
         clear_screen
