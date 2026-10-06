@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.4.4
+VERSION=2.4.5
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -2251,6 +2251,27 @@ def http_check(row):
                 if e.errno in (97,99):continue
                 raise Error('80 端口被占用或无法绑定；请选择 DNS 验证。')
 
+def lego_command(exe,home,row,renew=False):
+    version=call([exe,'--version']).decode()
+    match=re.search(r'(?:version\s*:?\s*|^v?)(\d+)\.',version,re.I|re.M)
+    if not match:raise Error('无法识别 lego 版本，未发起证书申请。')
+    major=int(match.group(1))
+    if major not in (4,5):raise Error('尚未适配此 lego 主版本，未发起申请。')
+    common=['--path',str(home),'--email',row['email'],'--accept-tos','--domains',row['domain']]
+    if row['method'] in ('dns','dns-manual'):common+=['--dns','manual' if row['method']=='dns-manual' else 'cloudflare']
+    else:common+=['--http','--http.address' if major==5 else '--http.port',':80']
+    if major==5:
+        helptext=call([exe,'run','--help']).decode()
+        required=['--path','--email','--domains','--accept-tos','--dns' if row['method'] in ('dns','dns-manual') else '--http']
+        if not all(flag in helptext for flag in required):raise Error('lego run 参数不匹配，未发起申请。')
+        # Legacy data can only be migrated by lego itself; preserve a private backup first.
+        if any((home/'accounts').glob('*/*/keys')):
+            backup=home.with_name(home.name+'-before-v5-'+str(time.time_ns()))
+            shutil.copytree(home,backup);os.chmod(backup,0o700)
+            call([exe,'migrate','--path',str(home)],timeout=120)
+        return [str(exe),'run']+common+(['--renew-force','--no-random-sleep'] if renew and row['method']=='dns-manual' else ['--renew-days','30'] if renew else [])
+    return [str(exe)]+common+(['renew','--days','3650' if row['method']=='dns-manual' else '30'] if renew else ['run'])
+
 @locked
 def client_issue(row,renew=False):
     home=pathlib.Path(row['client_home']) if row.get('client_home') else ROOT/'clients'/row['id']/row['client'];home.mkdir(parents=True,exist_ok=True);os.chmod(home,0o700)
@@ -2258,6 +2279,22 @@ def client_issue(row,renew=False):
     http_check(row);say('正在'+('续签' if renew else '申请')+'：'+row['domain']+' / '+row['client']) if sys.stdin.isatty() else None
     if row['client']=='acme.sh':
         exe=install_acme();base=['sh',exe,'--home',exe.parent,'--config-home',home,'--server','letsencrypt']
+        if row['method']=='dns-manual':
+            if not sys.stdin.isatty():raise Error('手动 DNS-01 需要交互终端。')
+            flag='--yes-I-know-dns-manual-mode-enough-go-ahead-please'
+            phase=['--renew','-d',row['domain'],'--ecc','--force',flag] if renew else ['--issue','-d',row['domain'],'--dns','--keylength','ec-256','--accountemail',row['email'],flag]
+            result=subprocess.run([str(a) for a in base+phase],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=900)
+            output=result.stdout.decode(errors='replace')
+            print(output,flush=True)
+            challenge='_acme-challenge' in output and 'TXT' in output
+            if challenge:
+                say('请添加上方列出的 TXT 名称和值；等待 DNS 生效后继续。','warn')
+                if not confirm('TXT 已添加并生效，继续验证？'):raise Cancel()
+                call(base+['--renew','-d',row['domain'],'--ecc',flag]+(['--force'] if renew else []),timeout=900,env=env,log=log)
+            elif result.returncode:
+                raise Error('未生成可用 TXT 挑战；请检查上方 acme.sh 错误。')
+            call(base+['--install-cert','-d',row['domain'],'--ecc','--fullchain-file',export/'fullchain.pem','--key-file',export/'privkey.pem','--reloadcmd','true'],timeout=60,env=env,log=log)
+            return export/'fullchain.pem',export/'privkey.pem'
         if renew:
             call(base+['--renew','-d',row['domain'],'--ecc'],timeout=900,env=env,log=log,allowed=(0,2))
         else:
@@ -2273,15 +2310,13 @@ def client_issue(row,renew=False):
         say('请按下方提示在 DNS 控制台添加 TXT 记录。','warn')
         say('主机记录通常为 _acme-challenge；完整名称和值以 lego 显示为准。','dim')
         say('等待 DNS 生效后再按回车；验证成功前保留 TXT，Ctrl+C 可取消。','dim')
-        args=[str(exe),'--path',str(home),'--email',row['email'],'--accept-tos','--domains',row['domain'],'--dns','manual']
-        args+=['renew','--days','3650'] if renew else ['run']
+        args=lego_command(exe,home,row,renew)
         result=subprocess.run(args,env=env)
-        if result.returncode:raise Error('手动 DNS 验证失败，旧证书与节点配置保持不变；请检查 TXT 后重试。')
+        if result.returncode:raise Error('lego 申请未完成，旧证书与节点配置保持不变；请根据上方错误检查程序参数、网络或 TXT 后重试。')
         filename=row['domain'].replace('*','_')
         return home/'certificates'/(filename+'.crt'),home/'certificates'/(filename+'.key')
-    exe=install_lego();base=[exe,'--path',home,'--email',row['email'],'--accept-tos','--domains',row['domain']]
-    base+=['--dns','cloudflare'] if row['method']=='dns' else ['--http','--http.port',':80']
-    call(base+(['renew','--days','30'] if renew else ['run']),timeout=900,env=env,log=log)
+    exe=install_lego();args=lego_command(exe,home,row,renew)
+    call(args,timeout=900,env=env,log=log)
     filename=row['domain'].replace('*','_');return home/'certificates'/(filename+'.crt'),home/'certificates'/(filename+'.key')
 
 def row_paths(row):
@@ -2344,7 +2379,8 @@ def issue_certificate(host=None,selfsigned=False):
     email=prompt('ACME 联系邮箱')
     if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise Error('请输入有效邮箱。')
     if method=='dns-manual':
-        client='lego';say('手动 DNS-01 使用 lego；后续续签也需人工添加 TXT。','warn')
+        selected=choose('手动 DNS 申请程序：1 acme.sh / 2 lego',('1','2'),'2');client='acme.sh' if selected=='1' else 'lego'
+        say('手动 DNS-01 使用 '+client+'；后续续签也需人工添加 TXT。','warn')
     else:
         client=choose('申请程序：1 acme.sh（主用）/ 2 lego（备用）',('1','2'),'1');client='acme.sh' if client=='1' else 'lego'
     row={'id':existing['id'] if existing else hashlib.sha256(('formal:'+host).encode()).hexdigest()[:20],'domain':host,'kind':'formal','client':client,'method':method,'email':email}
@@ -2353,8 +2389,8 @@ def issue_certificate(host=None,selfsigned=False):
         authfile=ROOT/'auth'/row['id']/('token-'+str(time.time_ns())+'.json')
         write(authfile,auth);row['auth_file']=str(authfile)
     try:cert,key=client_issue(row)
+    except Cancel:raise
     except Exception as e:
-        if method=='dns-manual':raise
         say(str(e),'warn')
         if not confirm('本次申请失败，改用备用程序申请？'):raise Cancel()
         row['client']='lego' if client=='acme.sh' else 'acme.sh'
