@@ -13,43 +13,55 @@ NSERVICE=vps-node
 NLOG=/var/log/vps-node.log
 RAW=https://raw.githubusercontent.com/Alsyok/argo/cores
 SCREEN_ACTIVE=0
-C_BLUE= C_PURPLE= C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
+C_ERROR= C_WARNING= C_RETRY= C_LINE= C_LINK= C_INSTALL= C_PROMPT= C_BLUE= C_PURPLE= C_RESET= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_DIM= C_WHITE=
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
     C_RESET=$(printf '\033[0m')
-    C_CYAN=$(printf '\033[1;36m')
-    C_BLUE=$(printf '\033[1;34m')
-    C_PURPLE=$(printf '\033[1;35m')
-    C_GREEN=$(printf '\033[1;32m')
-    C_YELLOW=$(printf '\033[1;33m')
-    C_RED=$(printf '\033[1;31m')
-    C_DIM=$(printf '\033[90m')
-    C_WHITE=$(printf '\033[1;37m')
+    C_CYAN=$(printf '\033[38;2;129;206;214m')
+    C_BLUE=$(printf '\033[38;2;136;179;223m')
+    C_PURPLE=$(printf '\033[38;2;181;161;223m')
+    C_GREEN=$(printf '\033[38;2;151;203;168m')
+    C_YELLOW=$(printf '\033[38;2;223;197;138m')
+    C_RED=$(printf '\033[38;2;225;155;155m')
+    C_DIM=$(printf '\033[38;2;164;175;190m')
+    C_WHITE=$(printf '\033[38;2;220;227;235m')
+    C_ERROR=$(printf '\033[38;2;255;85;85m')
+    C_WARNING=$(printf '\033[38;2;229;192;123m')
+    C_RETRY=$(printf '\033[38;2;192;132;252m')
+    C_LINE=$(printf '\033[38;2;82;103;124m')
+    C_LINK=$(printf '\033[38;2;255;250;205m')
+    C_INSTALL=$(printf '\033[38;2;144;238;144m')
+    C_PROMPT=$(printf '\033[38;2;154;205;50m')
 fi
 cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap 'cleanup; terminal_restore' EXIT
-die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+die() { printf '  %s错误：%s%s\n' "$C_ERROR" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
 print_prompt_defaults() {
     prompt_rest=$1
-    printf '%s' "$C_CYAN" >&2
+    prompt_color=${2:-$C_CYAN}
+    printf '%s' "$prompt_color" >&2
     while :; do
         case "$prompt_rest" in
             *'['*']'*)
                 prompt_before=${prompt_rest%%\[*}
                 prompt_after=${prompt_rest#*\[}
                 prompt_default=${prompt_after%%\]*}
-                printf '%s%s[%s]%s' "$prompt_before" "$C_PURPLE" "$prompt_default" "$C_CYAN" >&2
+                printf '%s%s[%s]%s' "$prompt_before" "$C_PURPLE" "$prompt_default" "$prompt_color" >&2
                 prompt_rest=${prompt_after#*\]};;
             *) printf '%s%s' "$prompt_rest" "$C_RESET" >&2; break;;
         esac
     done
 }
 ask() {
+    ask_base_color=$C_CYAN
+    case "${1#  }" in
+        '请选择 [0–15]：'|'已有本脚本管理的隧道。替换配置？'*|'本地 WS 端口 '*|'本地 WebSocket 路径 '*) ask_base_color=$C_PROMPT;;
+    esac
     case "$1" in
         *'输入 “YES/y” 继续，“NO/n” 取消：'*)
             ask_prefix=${1%%输入 “YES/y” 继续，“NO/n” 取消：*}
-            printf '  %s%s%s%s%s' "$C_CYAN" "${ask_prefix#  }" "$C_PURPLE" '输入 “YES/y” 继续，“NO/n” 取消：' "$C_RESET" >&2;;
-        *) printf '  ' >&2; print_prompt_defaults "${1#  }";;
+            printf '  %s%s%s%s%s' "$ask_base_color" "${ask_prefix#  }" "$C_PURPLE" '输入 “YES/y” 继续，“NO/n” 取消：' "$C_RESET" >&2;;
+        *) printf '  ' >&2; print_prompt_defaults "${1#  }" "$ask_base_color";;
     esac
     IFS= read -r REPLY || exit 0
     REPLY=$(printf '%s' "$REPLY" | tr -d '\r')
@@ -206,7 +218,7 @@ setup() {
         read_port 8080
         read_path
     else
-        printf '%s  请先在 CF 后台 → 配置域名 → http://127.0.0.1:本地端口。%s\n' "$C_RED" "$C_RESET"
+        printf '%s  请先在 CF 后台 → 配置域名 → http://127.0.0.1:本地端口。%s\n' "$C_ERROR" "$C_RESET"
         read_domain
         read_port 8080
         read_path
@@ -303,9 +315,12 @@ confirmed() {
     done
 }
 good() { printf '%s  ✓ %s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
-warn() { printf '%s  ⚠ %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
-retry_input() { printf '%s  ↻ %s%s\n' "$C_PURPLE" "$*" "$C_RESET" >&2; }
-rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"; }
+warn() { printf '%s  ⚠ %s%s\n' "$C_WARNING" "$*" "$C_RESET" >&2; }
+retry_input() { printf '%s  ↻ %s%s\n' "$C_RETRY" "$*" "$C_RESET" >&2; }
+rule() { printf '%s  ──────────────────────────────────────────%s\n' "$C_LINE" "$C_RESET"; }
+status_rule() {
+    printf '%s  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄%s\n' "$C_LINE" "$C_RESET"
+}
 read_port() {
     while :; do
         ask_form "本地 WS 端口 [$1]："
@@ -627,7 +642,7 @@ print_node_info() {
             域名：*|'SNI / WS Host：'*) info_color=$C_CYAN;;
             UUID：*) info_color=$C_PURPLE;;
             'WS 路径：'*) info_color=$C_YELLOW;;
-            vless://*) info_color=$C_WHITE;;
+            vless://*) info_color=$C_LINK;;
         esac
         printf '%s%s%s\n' "$info_color" "$info_line" "$C_RESET"
     done < "$NBASE/node-info.txt"
@@ -779,12 +794,12 @@ remove_node() {
     good '节点核心已卸载。'
 }
 header() {
-    printf '%s  【 ARGO · 隧道与节点管理 】%s\n' "$C_CYAN" "$C_RESET"; rule
+    printf '%s  【 ARGO · 隧道与节点管理 】%s\n' "$C_CYAN" "$C_RESET"; status_rule
     printf '  系统  %s%s%s / %s  ·  %sv%s%s\n' "$C_WHITE" "$ID" "$C_RESET" "$MANAGER" "$C_PURPLE" "$VERSION" "$C_RESET"
     if exists; then
         case "$(cat "$BASE/mode")" in quick) label=临时隧道;; *) label=固定隧道;; esac
         if connected; then state=已连接; color=$C_GREEN
-        elif control status >/dev/null 2>&1; then state='运行中 · 连接待确认'; color=$C_YELLOW
+        elif control status >/dev/null 2>&1; then state='运行中 · 连接待确认'; color=$C_WARNING
         else state=已停止; color=$C_DIM; fi
         printf '  隧道  %s · %s%s%s\n' "$label" "$color" "$state" "$C_RESET"
     else printf '  隧道  %s未安装%s\n' "$C_DIM" "$C_RESET"; fi
@@ -792,7 +807,7 @@ header() {
         if node_control status >/dev/null 2>&1; then state=运行中; color=$C_GREEN; else state=已停止; color=$C_DIM; fi
         printf '  核心  %s · %s%s%s\n' "$(cat "$NBASE/core")" "$color" "$state" "$C_RESET"
     else printf '  核心  %s未安装%s\n' "$C_DIM" "$C_RESET"; fi
-    rule
+    status_rule
 }
 run_action() {
     # Keep operational failures inside a subshell, allowing return to the menu.
@@ -1622,21 +1637,21 @@ main() {
     clear_screen
     while :; do
         header
-        printf '\n%s  【 TUNNEL / 隧道管理 】%s\n' "$C_BLUE" "$C_RESET"
-        menu_item "$C_CYAN" '1.' '安装临时隧道（保活 + 开机自启）'
-        menu_item "$C_CYAN" '2.' '安装固定隧道（保活 + 开机自启）'
+        printf '\n%s  【 TUNNEL / 隧道管理 】%s\n' "$C_CYAN" "$C_RESET"
+        menu_item "$C_INSTALL" '1.' '安装临时隧道（保活 + 开机自启）'
+        menu_item "$C_INSTALL" '2.' '安装固定隧道（保活 + 开机自启）'
         menu_item "$C_BLUE" '3.' '查看隧道状态 / 域名'
         menu_item "$C_YELLOW" '4.' '重启隧道'
         menu_item "$C_YELLOW" '5.' '停止隧道'
         menu_item "$C_BLUE" '6.' '查看隧道日志'
         menu_item "$C_RED" '7.' '卸载隧道'
-        printf '\n%s  【 NODE / 节点管理 】%s\n' "$C_PURPLE" "$C_RESET"
-        menu_item "$C_CYAN" '8.' '安装 / 切换节点核心'
+        printf '\n%s  【 NODE / 节点管理 】%s\n' "$C_CYAN" "$C_RESET"
+        menu_item "$C_INSTALL" '8.' '安装 / 切换节点核心'
         menu_item "$C_BLUE" '9.' '查询节点信息 / 分享链接'
         menu_item "$C_YELLOW" '10.' '重启节点'
         menu_item "$C_YELLOW" '11.' '停止节点'
         menu_item "$C_BLUE" '12.' '查看节点日志'
-        menu_item "$C_CYAN" '13.' '更新节点核心'
+        menu_item "$C_INSTALL" '13.' '更新节点核心'
         menu_item "$C_RED" '14.' '卸载节点核心'
         printf '\n%s  【 NETWORK / 网络设置 】%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
