@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.4.2
+VERSION=2.4.3
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -1974,10 +1974,11 @@ def geo(ip):
         except Exception:pass
     label=cache.get('label','');write(path,{'label':label,'expires':time.time()+600});return label
 
-def generate_links(cfg,meta):
+def generate_links(cfg,meta,indices=None):
     """Called by both saved installers' sync workers; parameters come from JSON."""
     lines=[];is_alpine=alpine()
     for pos,i in enumerate(cfg.get('inbounds',[])):
+        if indices is not None and pos not in indices:continue
         kind=i.get('type');tls=i.get('tls',{});reality=tls.get('reality',{}).get('enabled',False)
         if kind not in ('vless','hysteria2') or i.get('transport') or not tls.get('enabled'):raise Error('节点包含未支持的协议/传输，保留旧链接。')
         sni=domain(tls['server_name']);p=int(i['listen_port'])
@@ -2489,7 +2490,7 @@ def edit_node(kind):
     for i in indices:
         current=cfg['inbounds'][i];family=ipaddress.ip_address(current.get('listen','::')).version
         label='通配监听（可能双栈）' if current.get('listen','::')=='::' else 'IPv'+str(family)
-        say(label+' · '+current.get('tag','节点')+' · 监听：'+current.get('listen','::')+':'+str(current['listen_port']))
+        say(label+' · '+current.get('tag','节点')+' · 监听：'+('['+current.get('listen','::')+']' if family==6 else current.get('listen','0.0.0.0'))+':'+str(current['listen_port']))
         say('当前 SNI / 域名：'+current['tls'].get('server_name','未设置'),'default')
     say('留空分别保留各自原值；输入新值同时应用到所选节点。','dim')
     users=targets[0].get('users',[])
@@ -2557,6 +2558,12 @@ def edit_node(kind):
             tls=target['tls'];check_certificate(tls['certificate_path'],tls['key_path'],tls['server_name'],trust=cert_kind(tls['certificate_path'])=='formal')
     if not confirm('保存所选节点配置、重启 sing-box 并更新节点信息？'):return
     initialize_sync();commit_config(new,old)
+    try:
+        title('刚修改的节点链接 · 可直接复制')
+        print(color('link',generate_links(new,json.loads(META.read_text()),indices)),flush=True)
+        say('每条链接单独一行；复制到 v2rayN，从剪贴板导入。','dim')
+    except Exception:
+        say('配置已生效；链接展示失败，可到“查看节点信息”读取已保存链接。','warn')
     if kind=='reality' and alpine() and pathlib.Path('/etc/sing-box/reality_private_key.txt').exists():
         # The legacy informational files hold one pair; update only for a single pair.
         keys={i['tls']['reality']['private_key'] for i in new['inbounds'] if i.get('tls',{}).get('reality',{}).get('enabled')}
