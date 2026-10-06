@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.3.2
+VERSION=2.4.0
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -56,7 +56,7 @@ print_prompt_defaults() {
 ask() {
     ask_base_color=$C_CYAN
     case "${1#  }" in
-        '请选择 [0–17]：'|'已有本脚本管理的隧道。替换配置？'*|'本地 WS 端口 '*|'本地 WebSocket 路径 '*) ask_base_color=$C_PROMPT;;
+        '请选择 [0–18]：'|'已有本脚本管理的隧道。替换配置？'*|'本地 WS 端口 '*|'本地 WebSocket 路径 '*) ask_base_color=$C_PROMPT;;
     esac
     case "$1" in
         *'输入 “YES/y” 继续，“NO/n” 取消：'*)
@@ -1798,6 +1798,519 @@ singbox_standalone_install() {
     bash -n "$TMP/install.sh" || die '安装脚本语法检查失败，未执行。'
     bash "$TMP/install.sh"
 }
+standalone_manager_install() {
+    if ! command -v python3 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+        if [ "$MANAGER" = openrc ]; then apk add --no-cache python3 openssl
+        else apt-get update; apt-get install -y python3 openssl; fi
+    fi
+    mkdir -p /usr/local/lib/vps-cert-manager
+    chmod 700 /usr/local/lib/vps-cert-manager
+    cat > /usr/local/lib/vps-cert-manager/run.new <<'CERT_NODE_MANAGER_PY'
+#!/usr/bin/env python3
+"""Independent sing-box node and certificate manager; embedded in CFtunnel.sh."""
+import base64, copy, fcntl, getpass, json, os, pathlib, re, secrets, shlex
+import shutil, signal, subprocess, sys, tempfile, time, uuid
+
+ROOT = pathlib.Path('/etc/vps-cert-manager')
+CONFIG = pathlib.Path('/etc/sing-box/config.json')
+SELF = pathlib.Path('/usr/local/lib/vps-cert-manager/run')
+ACME = SELF.parent / 'acme.sh'
+
+def run(args, **kw):
+    return subprocess.run([str(x) for x in args], check=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, **kw).stdout.decode().strip()
+
+def atomic(path, data, mode=0o600):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data.encode() if isinstance(data, str) else data)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+def read(path):
+    return json.loads(pathlib.Path(path).read_text())
+
+def save(path, data):
+    atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+
+def ask(prompt, default='', secret=False):
+    value = (getpass.getpass if secret else input)(prompt + (f' [{default}]' if default and not secret else '') + '：').strip()
+    return value or default
+
+def choice(prompt, options):
+    while True:
+        value = ask(prompt)
+        if value in options: return value
+        print('输入无效，请重新选择。')
+
+def domain(value):
+    if len(value) > 253 or '.' not in value or not re.fullmatch(r'[a-zA-Z0-9.-]+', value):
+        raise RuntimeError('请输入完整域名，不含协议、端口或路径。')
+    if any(not re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', p) for p in value.split('.')):
+        raise RuntimeError('域名格式错误。')
+    return value.lower()
+
+def certificate(cert, key, name=None):
+    cert, key = str(cert), str(key)
+    run(['openssl','x509','-in',cert,'-noout','-checkend','0'])
+    pub = run(['openssl','x509','-in',cert,'-pubkey','-noout'])
+    if pub != run(['openssl','pkey','-in',key,'-pubout']):
+        raise RuntimeError('证书与私钥不匹配。')
+    if name:
+        result=run(['openssl','x509','-in',cert,'-noout','-checkhost',name])
+        if 'does NOT match' in result or 'does match' not in result:
+            raise RuntimeError('证书不支持此域名；请为新域名申请或选择匹配的证书。')
+    subject = run(['openssl','x509','-in',cert,'-noout','-subject']).partition('=')[2].strip()
+    issuer = run(['openssl','x509','-in',cert,'-noout','-issuer']).partition('=')[2].strip()
+    return subject == issuer
+
+def core():
+    meta = pathlib.Path('/var/lib/singbox-node-sync/deployment.json')
+    binary = read(meta).get('binary') if meta.exists() else shutil.which('sing-box')
+    if not binary or not pathlib.Path(binary).is_file(): raise RuntimeError('尚未安装独立 sing-box。')
+    return binary
+
+def service(action):
+    if shutil.which('rc-service'): run(['rc-service','sing-box',action])
+    else: run(['systemctl',action,'sing-box.service'])
+
+def active():
+    if shutil.which('rc-service'): run(['rc-service','sing-box','status'])
+    else: run(['systemctl','is-active','sing-box.service'])
+
+def sync_worker():
+    for path in ['/usr/local/lib/alpine-node-sync/run','/usr/local/lib/singbox-node-sync/run']:
+        p = pathlib.Path(path)
+        if p.is_file(): return p
+    raise RuntimeError('缺少节点同步组件，请先使用当前配套安装脚本安装。')
+
+def sync_patch(worker):
+    # Only patch the two known generators, leaving unknown workers untouched.
+    text = worker.read_text()
+    if 'def cert_insecure(' in text: return
+    first = "port=inbound['listen_port'];sni=tls.get('server_name','');insecure='0' if meta['mode']=='1' else '1'"
+    second = "reality=tls.get('reality',{}).get('enabled',False)\n        host=iphost"
+    if first in text:
+        text = text.replace(first, "port=inbound['listen_port'];sni=tls.get('server_name','');insecure=cert_insecure(tls) if not reality else '0'")
+    elif second in text:
+        text = text.replace(second, "reality=tls.get('reality',{}).get('enabled',False)\n        insecure=cert_insecure(tls) if not reality else '0'\n        host=iphost")
+    else: raise RuntimeError('同步组件版本不匹配，未修改配置。')
+    fn = '''def cert_insecure(tls):
+    cert=tls.get('certificate_path','')
+    subject=run(['openssl','x509','-in',cert,'-noout','-subject']).decode().partition('=')[2].strip()
+    issuer=run(['openssl','x509','-in',cert,'-noout','-issuer']).decode().partition('=')[2].strip()
+    return '1' if subject==issuer else '0'
+'''
+    text = text.replace('def generate(cfg,meta):', fn + 'def generate(cfg,meta):')
+    compile(text, str(worker), 'exec')
+    atomic(worker, text, 0o700)
+
+def apply_config(cfg):
+    binary, worker = core(), sync_worker()
+    old = CONFIG.read_bytes()
+    was_running = True
+    try: active()
+    except subprocess.CalledProcessError: was_running = False
+    worker_old = worker.read_bytes()
+    outputs = {p: p.read_bytes() if p.exists() else None for p in
+               [pathlib.Path('/root/singbox_nodes.txt'), pathlib.Path('/root/sb.txt')]}
+    with tempfile.TemporaryDirectory() as tmp:
+        candidate = pathlib.Path(tmp)/'config.json'; save(candidate,cfg)
+        run([binary,'check','-c',candidate])
+    backup = CONFIG.with_suffix('.json.before-menu')
+    atomic(backup, old)
+    changed = False
+    try:
+        sync_patch(worker)
+        # Refuse an intervening edit rather than replacing it.
+        if CONFIG.read_bytes() != old: raise RuntimeError('配置被其他程序修改，请重新打开菜单。')
+        save(CONFIG, cfg); changed = True
+        service('restart'); active()
+        run([worker,'--once'])
+    except BaseException:
+        if changed:
+            atomic(CONFIG, old)
+            atomic(worker, worker_old, 0o700)
+            try:
+                service('restart' if was_running else 'stop')
+                if was_running: run([worker,'--once'])
+            except Exception:
+                print('原配置已恢复，但服务恢复失败，请查看 sing-box 日志。',file=sys.stderr)
+            for p, data in outputs.items():
+                if data is None: p.unlink(missing_ok=True)
+                else: atomic(p,data)
+        else: atomic(worker, worker_old, 0o700)
+        raise RuntimeError('修改未完成，旧配置及节点链接已保留。')
+    print('配置校验、服务重启和节点链接更新成功。')
+
+def certs():
+    found = []
+    if ROOT.exists():
+        for p in sorted(ROOT.glob('*/record.json')):
+            try:
+                rec = read(p)
+                found.append((rec['domain'], str(p.parent/'fullchain.pem'), str(p.parent/'key.pem'), rec.get('owner','导入')))
+            except (OSError, ValueError, KeyError): pass
+    if CONFIG.exists():
+        for node in read(CONFIG).get('inbounds',[]):
+            tls = node.get('tls',{})
+            if tls.get('certificate_path') and tls.get('key_path'):
+                item = (tls.get('server_name',''),tls['certificate_path'],tls['key_path'],'原配置')
+                if not any(x[1:3]==item[1:3] for x in found): found.append(item)
+    return found
+
+def show_certs():
+    items = certs()
+    for n, (name, cert, key, owner) in enumerate(items, 1):
+        print(f'\n{n}. {name} · {owner}\n   证书：{cert}\n   私钥路径：{key}')
+        try:
+            print('   类型：' + ('自签' if certificate(cert,key) else '非自签'))
+            print(run(['openssl','x509','-in',cert,'-noout','-dates','-ext','subjectAltName']))
+        except Exception: print('   证书不可用、已过期或私钥不匹配。')
+    if not items: print('还没有证书记录。')
+    return items
+
+def ensure_packages(packages):
+    if shutil.which('apk'): run(['apk','add','--no-cache',*packages])
+    else:
+        run(['apt-get','update'])
+        run(['apt-get','install','-y',*packages])
+
+def ensure_acme():
+    if not ACME.exists() or not (ACME.parent/'dnsapi/dns_cf.sh').exists():
+        ensure_packages(['curl','socat','openssl','ca-certificates'])
+        for name in ['acme.sh','dnsapi/dns_cf.sh']:
+            dest = ACME.parent/name; dest.parent.mkdir(parents=True,exist_ok=True)
+            candidate=dest.with_suffix(dest.suffix+'.download')
+            run(['curl','-fLsS','--retry','2','--max-time','120',
+                 'https://raw.githubusercontent.com/acmesh-official/acme.sh/master/'+name,'-o',candidate])
+            run(['sh','-n',candidate]); os.chmod(candidate,0o700); os.replace(candidate,dest)
+
+def ensure_certbot(dns):
+    if not shutil.which('certbot') or (dns and 'dns-cloudflare' not in run(['certbot','plugins'])):
+        ensure_packages(['certbot'] + (['certbot-dns-cloudflare' if shutil.which('apk') else 'python3-certbot-dns-cloudflare'] if dns else []))
+
+def acme_args(rec):
+    home = ROOT/rec['domain']/'acme'
+    return ['sh',ACME,'--home',ACME.parent,'--config-home',home,'--cert-home',home/'certs','--server','letsencrypt']
+
+def bot_args(rec):
+    d = ROOT/rec['domain']
+    return ['certbot','--config-dir',d/'certbot','--work-dir',d/'work','--logs-dir',d/'logs']
+
+def hook(name):
+    return shlex.join([str(SELF),'deploy',name])
+
+def deploy(name):
+    name = domain(name); d = ROOT/name; rec = read(d/'record.json')
+    if rec['owner']=='certbot':
+        src = d/'certbot'/'live'/name
+        atomic(d/'incoming.pem',(src/'fullchain.pem').read_bytes())
+        atomic(d/'incoming.key',(src/'privkey.pem').read_bytes())
+    certificate(d/'incoming.pem',d/'incoming.key',name)
+    old = {p:p.read_bytes() if p.exists() else None for p in [d/'fullchain.pem',d/'key.pem']}
+    incoming={(d/'fullchain.pem'):(d/'incoming.pem').read_bytes(),(d/'key.pem'):(d/'incoming.key').read_bytes()}
+    if old==incoming: return
+    cfg = read(CONFIG) if CONFIG.exists() else None
+    used = cfg and any(str(d/'fullchain.pem')==x.get('tls',{}).get('certificate_path') for x in cfg.get('inbounds',[]))
+    try:
+        atomic(d/'fullchain.pem',(d/'incoming.pem').read_bytes())
+        atomic(d/'key.pem',(d/'incoming.key').read_bytes())
+        if used: apply_config(cfg)
+    except BaseException:
+        for p,data in old.items():
+            if data is None: p.unlink(missing_ok=True)
+            else: atomic(p,data)
+        if used:
+            try: service('restart'); run([sync_worker(),'--once'])
+            except Exception: print('证书已恢复，服务恢复失败，请检查日志。',file=sys.stderr)
+        raise
+    print(name+'：证书已验证并部署。')
+
+def scheduler():
+    # Own one job; do not edit the user's crontab or other issuers' timers.
+    if shutil.which('rc-service'):
+        if not pathlib.Path('/etc/init.d/crond').exists(): ensure_packages(['dcron'])
+        atomic('/etc/periodic/daily/vps-cert-renew', '#!/bin/sh\n'+shlex.join([str(SELF),'renew-all'])+'\n',0o700)
+        run(['rc-update','add','crond','default']); run(['rc-service','crond','start'])
+    else:
+        atomic('/etc/systemd/system/vps-cert-renew.service',
+               '[Unit]\nDescription=Renew toolbox certificates\n[Service]\nType=oneshot\nExecStart='+str(SELF)+' renew-all\nUMask=0077\n',0o644)
+        atomic('/etc/systemd/system/vps-cert-renew.timer',
+               '[Unit]\nDescription=Daily toolbox certificate renewal\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=1h\n[Install]\nWantedBy=timers.target\n',0o644)
+        run(['systemctl','daemon-reload']); run(['systemctl','enable','--now','vps-cert-renew.timer'])
+
+def issue(name=None):
+    name = domain(name or ask('申请的域名'))
+    d = ROOT/name; record = d/'record.json'
+    if record.exists():
+        print('此域名已有管理记录；请续签原记录，避免重复签发。')
+        return str(d/'fullchain.pem'), str(d/'key.pem'), name
+    method = choice('验证：1 HTTP-01（公网 TCP 80） 2 Cloudflare DNS API 0 取消', ['0','1','2'])
+    if method=='0': raise RuntimeError('已取消申请。')
+    print('HTTP-01 需要域名解析到这台服务器，且公网能到达 TCP 80；DNS API 可用于 NAT 或无开放端口的服务器。')
+    email = ask('ACME 账户邮箱')
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email): raise RuntimeError('邮箱格式错误。')
+    owner = choice('签发程序：1 acme.sh 2 Certbot 0 取消',['0','1','2'])
+    if owner=='0': raise RuntimeError('已取消申请。')
+    rec = {'domain':name,'owner':'acme.sh' if owner=='1' else 'certbot','method':method,'email':email}
+    d.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(d,0o700)
+    token = account = ''
+    if method=='2':
+        token = ask('Cloudflare API Token（仅需目标区域 DNS 编辑权限）',secret=True)
+        if not token: raise RuntimeError('Token 不能为空。')
+        if owner=='1': account = ask('Cloudflare Account ID（可回车自动查询）')
+    while True:
+        try:
+            if owner=='1':
+                ensure_acme()
+                env = dict(os.environ)
+                if token: env['CF_Token']=token
+                if account: env['CF_Account_ID']=account
+                run(acme_args(rec)+['--register-account','--accountemail',email],env=env)
+                run(acme_args(rec)+['--issue','-d',name,'--keylength','ec-256']+
+                    (['--standalone'] if method=='1' else ['--dns','dns_cf']),env=env)
+                save(record,rec)
+                run(acme_args(rec)+['--install-cert','-d',name,'--ecc','--fullchain-file',d/'incoming.pem',
+                                   '--key-file',d/'incoming.key','--reloadcmd',hook(name)])
+            else:
+                ensure_certbot(method=='2')
+                opts = ['--standalone']
+                if method=='2':
+                    atomic(d/'cloudflare.ini','dns_cloudflare_api_token = '+token+'\n')
+                    opts = ['--dns-cloudflare','--dns-cloudflare-credentials',d/'cloudflare.ini','--dns-cloudflare-propagation-seconds','60']
+                run(bot_args(rec)+['certonly','--non-interactive','--agree-tos','--email',email,
+                                  '--cert-name',name,'-d',name,*opts])
+                save(record,rec); deploy(name)
+            scheduler()
+            return str(d/'fullchain.pem'),str(d/'key.pem'),name
+        except Exception:
+            # A successfully issued certificate keeps its issuer even if deployment failed.
+            if record.exists():
+                raise RuntimeError('已保留签发程序记录，但部署或自动续签设置失败；请在 18 中重试续签/部署。')
+            print('申请失败，请检查 DNS、端口、Token 或签发日志。')
+            alt = choice('1 使用备用签发程序重试 0 返回',['0','1'])
+            if alt=='0': raise RuntimeError('申请失败，节点配置未修改。')
+            owner = '2' if owner=='1' else '1'; rec['owner']='acme.sh' if owner=='1' else 'certbot'
+            if method=='2' and owner=='1' and not account: account=ask('Cloudflare Account ID（可回车自动查询）')
+
+def renew(name, force=False):
+    name = domain(name); d = ROOT/name; rec = read(d/'record.json')
+    if rec['owner']=='acme.sh':
+        try: run(acme_args(rec)+['--renew','-d',name,'--ecc']+(['--force'] if force else []))
+        except subprocess.CalledProcessError as e:
+            if e.returncode!=2: raise
+            print(name+'：尚未到续签时间。')
+    elif rec['owner']=='certbot':
+        run(bot_args(rec)+['renew','--non-interactive','--cert-name',name,'--deploy-hook',hook(name)]+
+            (['--force-renewal'] if force else []))
+    elif rec['owner']=='自签': raise RuntimeError('自签证书不使用 ACME 续签；请重新生成并选择新证书。')
+    else: raise RuntimeError('导入证书由原程序负责续签，此处只提供调用。')
+    # Also retry a deployment that previously failed after successful issuance.
+    if rec['owner']=='certbot' or (d/'incoming.pem').exists(): deploy(name)
+
+def renew_all():
+    failures=[]
+    for p in ROOT.glob('*/record.json'):
+        rec=read(p)
+        if rec.get('owner') not in ('acme.sh','certbot'): continue
+        try: renew(rec['domain'])
+        except subprocess.CalledProcessError as e:
+            # acme.sh returns 2 when the certificate is not yet due.
+            if rec['owner']=='acme.sh' and e.returncode==2: continue
+            failures.append(rec['domain'])
+        except Exception: failures.append(rec['domain'])
+    if failures: raise RuntimeError('续签/部署失败：'+', '.join(failures)+'；旧部署证书已保留。')
+
+def self_signed(name):
+    name=domain(name); ident='self-'+name+'-'+secrets.token_hex(4)
+    d=ROOT/ident; d.mkdir(mode=0o700,parents=True)
+    run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','365',
+         '-keyout',d/'key.pem','-out',d/'fullchain.pem','-subj','/CN='+name,'-addext','subjectAltName=DNS:'+name])
+    os.chmod(d/'key.pem',0o600); os.chmod(d/'fullchain.pem',0o600)
+    certificate(d/'fullchain.pem',d/'key.pem',name)
+    save(d/'record.json',{'domain':name,'owner':'自签'})
+    return str(d/'fullchain.pem'),str(d/'key.pem'),name
+
+def pick_certificate(tls):
+    mode=choice('证书：1 保留原证书 2 已有列表 3 输入域名申请正式证书 4 自签 5 手动路径 0 取消', ['0','1','2','3','4','5'])
+    if mode=='0': raise RuntimeError('已取消修改。')
+    if mode=='1':
+        name=domain(ask('SNI / 域名',tls.get('server_name','')))
+        cert,key=tls['certificate_path'],tls['key_path']
+    elif mode=='2':
+        items=show_certs()
+        if not items: raise RuntimeError('证书列表为空。')
+        n=choice('选择序号（0 返回）',['0']+[str(i) for i in range(1,len(items)+1)])
+        if n=='0': raise RuntimeError('已取消修改。')
+        oldname,cert,key,_=items[int(n)-1]; name=domain(ask('用于节点的域名',oldname))
+    elif mode=='3': cert,key,name=issue()
+    elif mode=='4': cert,key,name=self_signed(ask('自签证书域名',tls.get('server_name','')))
+    else:
+        cert=ask('证书完整路径'); key=ask('私钥完整路径'); name=domain(ask('用于节点的域名'))
+    if certificate(cert,key,name): print('此证书是自签证书，客户端链接将标记跳过证书验证。')
+    return cert,key,name
+
+def nodes(cfg,kind):
+    return [i for i,x in enumerate(cfg.get('inbounds',[])) if
+            x.get('tls',{}).get('enabled') and not x.get('transport') and
+            ((kind=='reality' and x.get('type')=='vless' and x.get('tls',{}).get('reality',{}).get('enabled')) or
+             (kind=='tls' and x.get('type')=='vless' and not x.get('tls',{}).get('reality',{}).get('enabled')) or
+             (kind=='hy2' and x.get('type')=='hysteria2'))]
+
+def edit_node(kind):
+    cfg=read(CONFIG); available=nodes(cfg,kind)
+    if not available: raise RuntimeError('未发现此类型节点。')
+    for n,i in enumerate(available,1):
+        x=cfg['inbounds'][i]; print(f"{n}. {x.get('tag',kind)} · {x.get('listen')}:{x.get('listen_port')}")
+    n=choice('选择要修改的入站（0 返回）',['0']+[str(i) for i in range(1,len(available)+1)])
+    if n=='0': return
+    i=available[int(n)-1]; node=cfg['inbounds'][i]; tls=node['tls']
+    users=node.get('users',[])
+    if not users: raise RuntimeError('入站没有用户。')
+    u=0
+    if len(users)>1:
+        for n,x in enumerate(users,1): print(str(n)+'. '+x.get('name','用户 '+str(n)))
+        u=int(choice('选择用户',[str(n) for n in range(1,len(users)+1)]))-1
+    port=ask('端口（回车保留）',str(node['listen_port']))
+    if not port.isdigit() or not 1<=int(port)<=65535: raise RuntimeError('端口范围是 1–65535。')
+    node['listen_port']=int(port)
+    if kind=='hy2':
+        password=ask('HY2 密码（回车保留）',users[u].get('password',''),secret=True)
+        if not password: raise RuntimeError('密码不能为空。')
+        users[u]['password']=password
+    else:
+        value=ask('UUID（回车保留，输入 new 生成）',users[u].get('uuid',''))
+        users[u]['uuid']=str(uuid.uuid4() if value.lower()=='new' else uuid.UUID(value))
+    if kind=='reality':
+        print('Reality 使用握手目标，不调用本地 TLS 证书。')
+        tls['server_name']=domain(ask('Reality SNI',tls.get('server_name','')))
+        reality=tls['reality']; handshake=reality.setdefault('handshake',{})
+        handshake['server']=domain(ask('握手目标',handshake.get('server',tls['server_name'])))
+        p=ask('握手端口',str(handshake.get('server_port',443)))
+        if not p.isdigit() or not 1<=int(p)<=65535: raise RuntimeError('握手端口无效。')
+        handshake['server_port']=int(p)
+        sid=ask('Short ID（new 生成）',(reality.get('short_id') or [''])[0])
+        if sid=='new': sid=secrets.token_hex(4)
+        if not re.fullmatch('[a-fA-F0-9]{0,16}',sid) or len(sid)%2: raise RuntimeError('Short ID 必须是偶数位十六进制，最多 16 位。')
+        reality['short_id']=[sid]
+        if choice('密钥对：1 保留 2 生成新密钥对',['1','2'])=='2':
+            keys=run([core(),'generate','reality-keypair'])
+            match=re.search(r'PrivateKey:\s*(\S+)',keys)
+            if not match: raise RuntimeError('无法解析核心生成的密钥对。')
+            reality['private_key']=match.group(1)
+    else:
+        oldpair=(tls.get('certificate_path'),tls.get('key_path'))
+        cert,key,name=pick_certificate(tls)
+        shared=[j for j,x in enumerate(cfg['inbounds']) if j!=i and not x.get('tls',{}).get('reality',{}).get('enabled') and
+                (x.get('tls',{}).get('certificate_path'),x.get('tls',{}).get('key_path'))==oldpair]
+        targets=[i]
+        if shared:
+            print('共用原证书的其他入站：'+', '.join(cfg['inbounds'][j].get('tag',str(j)) for j in shared))
+            if choice('1 只修改当前入站 2 共用证书的入站一起更换',['1','2'])=='2': targets+=shared
+        for j in targets:
+            cfg['inbounds'][j]['tls'].update(server_name=name,certificate_path=cert,key_path=key)
+    if choice('保存并重启？1 保存 0 取消',['0','1'])=='0': return
+    apply_config(cfg)
+    # These optional files are references; link generation reads the actual config.
+    if kind=='reality' and pathlib.Path('/etc/sing-box/reality_private_key.txt').exists():
+        raw=base64.urlsafe_b64decode(reality['private_key']+'=')
+        der=bytes.fromhex('302e020100300506032b656e04220420')+raw
+        pub=subprocess.run(['openssl','pkey','-inform','DER','-pubout','-outform','DER'],input=der,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE).stdout[-32:]
+        atomic('/etc/sing-box/reality_private_key.txt',reality['private_key']+'\n')
+        atomic('/etc/sing-box/reality_public_key.txt',base64.urlsafe_b64encode(pub).decode().rstrip('=')+'\n')
+
+def cert_menu():
+    while True:
+        print('\n【证书申请与续签】\n1. 申请正式证书（acme.sh / Certbot，HTTP / Cloudflare DNS）\n2. 查看全部证书\n3. 续签 / 重新部署\n4. 生成自签证书\n5. 检查并启用自动续签\n0. 返回首页')
+        c=choice('请选择',['0','1','2','3','4','5'])
+        if c=='0': return
+        try:
+            if c=='1': issue()
+            elif c=='2': show_certs()
+            elif c=='3':
+                name=domain(ask('已管理的正式证书域名'))
+                mode=choice('1 检查到期并续签 / 部署 2 强制续签（会消耗签发额度） 0 取消',['0','1','2'])
+                if mode!='0':
+                    try: renew(name,mode=='2')
+                    except subprocess.CalledProcessError as e:
+                        if read(ROOT/name/'record.json')['owner']=='acme.sh' and e.returncode==2: print('尚未到续签时间。')
+                        else: raise
+            elif c=='4': print('已生成：'+self_signed(ask('自签域名'))[0])
+            else: scheduler(); print('每日自动检查已启用，由原签发程序续签。')
+        except Exception as e: report(e)
+
+def node_menu():
+    while True:
+        print('\n【更改节点】\n1. VLESS-Reality\n2. VLESS-TLS\n3. Hysteria2\n0. 返回')
+        c=choice('请选择',['0','1','2','3'])
+        if c=='0': return
+        try: edit_node({'1':'reality','2':'tls','3':'hy2'}[c])
+        except Exception as e: report(e)
+
+def report(e):
+    # Never dump captured issuer output; it may contain account credentials.
+    print('操作未完成：'+(str(e) if isinstance(e,RuntimeError) else type(e).__name__+'；请检查配置、依赖或签发程序日志。'),file=sys.stderr)
+
+def main():
+    if os.geteuid()!=0: raise RuntimeError('请使用 root 运行。')
+    ROOT.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(ROOT,0o700)
+    mode=sys.argv[1] if len(sys.argv)>1 else 'cert-menu'
+    # Issuers invoke the deploy hook as a child; it must not acquire the parent lock.
+    if mode=='deploy': deploy(sys.argv[2]); return
+    with open(ROOT/'.lock','a') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('另一个节点/证书管理操作正在运行，请稍后重试。')
+        if mode=='cert-menu': cert_menu()
+        elif mode=='nodes': node_menu()
+        elif mode=='cert-list': show_certs()
+        elif mode=='info':
+            run([sync_worker(),'--once'])
+            print(pathlib.Path('/root/singbox_nodes.txt').read_text())
+        elif mode=='renew-all': renew_all()
+        else: raise RuntimeError('未知运行参数。')
+
+if __name__=='__main__':
+    def interrupted(signum, frame): raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, interrupted)
+    try: main()
+    except (EOFError,KeyboardInterrupt): print('\n已取消。'); sys.exit(130)
+    except Exception as e: report(e); sys.exit(1)
+CERT_NODE_MANAGER_PY
+    python3 -c 'import ast; ast.parse(open("/usr/local/lib/vps-cert-manager/run.new").read())' || die '节点管理组件语法检查失败。'
+    chmod 700 /usr/local/lib/vps-cert-manager/run.new
+    mv /usr/local/lib/vps-cert-manager/run.new /usr/local/lib/vps-cert-manager/run
+}
+standalone_manage() {
+    standalone_manager_install
+    /usr/local/lib/vps-cert-manager/run "$1"
+}
+singbox_system_menu() {
+    standalone_system=$1
+    while :; do
+        printf '\n%s  【 %s · sing-box 管理 】%s\n' "$C_CYAN" "$standalone_system" "$C_RESET"; rule
+        menu_item "$C_INSTALL" '1.' '安装 sing-box'
+        menu_item "$C_BLUE" '2.' '查看节点信息'
+        menu_item "$C_BLUE" '3.' '查看全部证书'
+        menu_item "$C_YELLOW" '4.' '更改节点'
+        menu_item "$C_DIM" '0.' '返回安装菜单'
+        ask '请选择 [0–4]：'
+        case "$REPLY" in
+            1) run_action singbox_standalone_install "$standalone_system";;
+            2) run_action standalone_manage info;;
+            3) run_action standalone_manage cert-list;;
+            4) run_action standalone_manage nodes;;
+            0) return;;
+            *) retry_input '请输入 0–4。';;
+        esac
+    done
+}
 singbox_standalone_menu() {
     while :; do
         printf '\n%s  【 singbox一键安装 】%s\n' "$C_CYAN" "$C_RESET"; rule
@@ -1810,10 +2323,10 @@ singbox_standalone_menu() {
         case "$REPLY" in
             1)
                 if [ "$MANAGER" != systemd ]; then retry_input '当前是 Alpine，请选择 2。'; continue; fi
-                run_action singbox_standalone_install debian; return;;
+                singbox_system_menu debian;;
             2)
                 if [ "$MANAGER" != openrc ]; then retry_input '当前是 Ubuntu / Debian，请选择 1。'; continue; fi
-                run_action singbox_standalone_install alpine; return;;
+                singbox_system_menu alpine;;
             0) return;;
             *) retry_input '请输入 0、1 或 2。';;
         esac
@@ -1846,12 +2359,13 @@ main() {
         menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
         menu_item "$C_INSTALL" '16.' 'BBR 管理'
         printf '\n%s  【 singbox一键安装 】%s\n' "$C_CYAN" "$C_RESET"
-        menu_item "$C_INSTALL" '17.' '打开安装菜单'
+        menu_item "$C_INSTALL" '17.' '安装 / 查看 / 更改 sing-box 节点'
+        menu_item "$C_INSTALL" '18.' '证书申请与续签'
         menu_item "$C_DIM" '0.' '退出'
         rule
         while :; do
-            ask '  请选择 [0–17]：'
-            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17) break;; *) retry_input '请输入 0–17，重新选择即可。';; esac
+            ask '  请选择 [0–18]：'
+            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18) break;; *) retry_input '请输入 0–18，重新选择即可。';; esac
         done
         case "$REPLY" in
             1) run_action setup quick;; 2) fixed_menu;; 3) run_action status;;
@@ -1861,7 +2375,7 @@ main() {
             10) if node_exists; then run_action node_control restart; else warn '尚未安装节点。'; fi;;
             11) if node_exists; then run_action node_stop; else warn '尚未安装节点。'; fi;;
             12) run_action node_logs;; 13) run_action update_node;; 14) run_action remove_node;;
-            15) run_action set_transport;; 16) bbr_menu;; 17) singbox_standalone_menu;; 0) exit 0;; *) retry_input '请输入正确选项。';;
+            15) run_action set_transport;; 16) bbr_menu;; 17) singbox_standalone_menu;; 18) run_action standalone_manage cert-menu;; 0) exit 0;; *) retry_input '请输入正确选项。';;
         esac
         finish_screen
         clear_screen
