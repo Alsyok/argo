@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.4.8
+VERSION=2.4.9
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -2048,7 +2048,8 @@ def generate_links(cfg,meta,indices=None):
                 else:q['allowInsecure']=insecure
             else:
                 uid=urllib.parse.quote(u['password'],safe='');scheme='hysteria2://';prefix='HY2';q={'sni':sni,'insecure':insecure}
-            suffix=geo(ip);label=prefix+'-'+i.get('tag',str(pos+1))+'-'+host+('-'+suffix if suffix else '')
+            family=ipaddress.ip_address(ip).version
+            suffix=geo(ip);label=prefix+'-V'+str(family)+'PORT-'+host+('-'+suffix if suffix else '')
             lines.append(scheme+uid+'@'+host+':'+str(p)+'?'+urllib.parse.urlencode(q,quote_via=urllib.parse.quote)+'#'+urllib.parse.quote(label,safe=''))
     if not lines:raise Error('没有可生成的节点。')
     return '\n'.join(lines)+'\n'
@@ -2720,7 +2721,9 @@ def main():
             try:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:return
             renew_due()
-    elif action=='post-install':initialize_sync();service('restart');time.sleep(2);sync_now()
+    elif action=='post-install':
+        initialize_sync();service('restart');time.sleep(2);sync_now()
+        title('统一命名后的节点链接');print(color('link',LINKFILES[0].read_text()),flush=True)
     else:raise Error('未知管理选项。')
 if __name__=='__main__':
     def stop_requested(signum,frame):raise KeyboardInterrupt()
