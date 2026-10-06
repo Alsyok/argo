@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.4.1
+VERSION=2.4.2
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -2434,7 +2434,7 @@ def reality_probe(host,sni,port=443):
     if b'TLSv1.3' not in result:raise Error('伪装目标未确认支持 TLS 1.3。')
 
 def select_inbounds(cfg,kind):
-    groups={4:[],6:[]}
+    groups={4:[],6:[]};wildcards=[]
     for index,inbound in enumerate(cfg.get('inbounds',[])):
         reality=inbound.get('tls',{}).get('reality',{}).get('enabled',False)
         matches=(kind=='reality' and inbound.get('type')=='vless' and reality) or (kind=='tls' and inbound.get('type')=='vless' and not reality) or (kind=='hy2' and inbound.get('type')=='hysteria2')
@@ -2442,10 +2442,21 @@ def select_inbounds(cfg,kind):
         try:family=ipaddress.ip_address(inbound.get('listen','::')).version
         except ValueError:raise Error('无法识别节点监听地址，请检查配置。')
         groups[family].append(index)
+        if inbound.get('listen','::')=='::':wildcards.append(index)
     if not any(groups.values()):raise Error('没有该协议的节点。')
     title('选择修改范围');item(1,'IPv4','edit');item(2,'IPv6','edit');item(3,'IPv4 和 IPv6','edit');item(0,'返回上一级','dim')
     selected=choose('请选择修改范围',('0','1','2','3'))
     if selected=='0':raise Cancel()
+    # A sole IPv6 wildcard is one configuration, not two independently editable nodes.
+    # Do not infer actual IPv4 reachability from the wildcard alone.
+    if not groups[4] and len(groups[6])==1 and wildcards==groups[6]:
+        index=groups[6][0];inbound=cfg['inbounds'][index]
+        say('当前协议只有一组配置，监听 [::]:'+str(inbound['listen_port'])+'；可能接收双栈连接。','warn')
+        say('IPv4 是否可连接取决于实际监听和系统设置；UUID、SNI 等是这组配置共用的参数。','dim')
+        if selected in ('1','2'):
+            say('无法只对 IPv'+('4' if selected=='1' else '6')+' 单独修改这组共用参数。','warn')
+            if not confirm('继续修改这组配置（会影响所有使用它的连接）？'):raise Cancel()
+        return [index]
     families={'1':[4],'2':[6],'3':[4,6]}[selected];indices=[]
     for family in families:
         candidates=groups[family]
@@ -2477,7 +2488,8 @@ def edit_node(kind):
     title('修改 '+{'reality':'VLESS-Reality','tls':'VLESS-TLS','hy2':'Hysteria2'}[kind])
     for i in indices:
         current=cfg['inbounds'][i];family=ipaddress.ip_address(current.get('listen','::')).version
-        say('IPv'+str(family)+' · '+current.get('tag','节点')+' · 监听：'+current.get('listen','::')+':'+str(current['listen_port']))
+        label='通配监听（可能双栈）' if current.get('listen','::')=='::' else 'IPv'+str(family)
+        say(label+' · '+current.get('tag','节点')+' · 监听：'+current.get('listen','::')+':'+str(current['listen_port']))
         say('当前 SNI / 域名：'+current['tls'].get('server_name','未设置'),'default')
     say('留空分别保留各自原值；输入新值同时应用到所选节点。','dim')
     users=targets[0].get('users',[])
