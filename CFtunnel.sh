@@ -29,12 +29,27 @@ cleanup() { [ -z "$TMP" ] || rm -rf "$TMP"; }
 trap 'cleanup; terminal_restore' EXIT
 die() { printf '  %s错误：%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 ask_form() { printf '\n' >&2; ask "$1"; }
+print_prompt_defaults() {
+    prompt_rest=$1
+    printf '%s' "$C_CYAN" >&2
+    while :; do
+        case "$prompt_rest" in
+            *'['*']'*)
+                prompt_before=${prompt_rest%%\[*}
+                prompt_after=${prompt_rest#*\[}
+                prompt_default=${prompt_after%%\]*}
+                printf '%s%s[%s]%s' "$prompt_before" "$C_PURPLE" "$prompt_default" "$C_CYAN" >&2
+                prompt_rest=${prompt_after#*\]};;
+            *) printf '%s%s' "$prompt_rest" "$C_RESET" >&2; break;;
+        esac
+    done
+}
 ask() {
     case "$1" in
         *'输入 “YES/y” 继续，“NO/n” 取消：'*)
             ask_prefix=${1%%输入 “YES/y” 继续，“NO/n” 取消：*}
             printf '  %s%s%s%s%s' "$C_CYAN" "${ask_prefix#  }" "$C_PURPLE" '输入 “YES/y” 继续，“NO/n” 取消：' "$C_RESET" >&2;;
-        *) printf '  %s%s%s' "$C_CYAN" "${1#  }" "$C_RESET" >&2;;
+        *) printf '  ' >&2; print_prompt_defaults "${1#  }";;
     esac
     IFS= read -r REPLY || exit 0
     REPLY=$(printf '%s' "$REPLY" | tr -d '\r')
