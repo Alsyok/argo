@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.4.5
+VERSION=2.4.6
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -821,6 +821,7 @@ run_action() {
     action_result=$?
     if [ "$pause_owner" = 1 ]; then rm -f "$APIBASE/pause-pid"; fi
     set -e
+    [ "$action_result" != 130 ] && [ "$action_result" != 143 ] || exit "$action_result"
     if [ "$action_result" -ne 0 ]; then warn '操作未完成，请查看上面的错误提示。'; fi
 }
 # API features are isolated from the original manual deployment functions.
@@ -1809,7 +1810,7 @@ standalone_tools() {
     cat > "$standalone_helper_tmp" <<'ARGO_STANDALONE_PY'
 #!/usr/bin/env python3
 """Independent sing-box and certificate management; never manages vps-node."""
-import textwrap,contextlib,functools,base64,copy,datetime,fcntl,getpass,hashlib,importlib.util,ipaddress,json,os,pathlib,re,secrets,shutil,socket,ssl,subprocess,sys,tarfile,tempfile,time,urllib.parse,urllib.request,uuid
+import signal,textwrap,contextlib,functools,base64,copy,datetime,fcntl,getpass,hashlib,importlib.util,ipaddress,json,os,pathlib,re,secrets,shutil,socket,ssl,subprocess,sys,tarfile,tempfile,time,urllib.parse,urllib.request,uuid
 ROOT=pathlib.Path('/etc/argo-certificates')
 LIB=pathlib.Path('/usr/local/lib/argo-standalone')
 CONFIG=pathlib.Path('/etc/sing-box/config.json')
@@ -1867,9 +1868,12 @@ def management_lock():
         finally:_lock_depth-=1
         return
     with open(ROOT/'manager.lock','a') as f:
-        fcntl.flock(f,fcntl.LOCK_EX);_lock_depth=1
+        try:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise Error('已有申请或配置修改正在进行，请先完成或取消原操作。')
+        _lock_depth=1
         try:yield
-        finally:_lock_depth=0
+        finally:
+            _lock_depth=0;fcntl.flock(f,fcntl.LOCK_UN)
 def locked(func):
     @functools.wraps(func)
     def wrapper(*args,**kwargs):
@@ -1877,12 +1881,32 @@ def locked(func):
     return wrapper
 def read(path):return json.loads(pathlib.Path(path).read_text())
 def write(path,obj):atomic(path,json.dumps(obj,ensure_ascii=False,indent=2)+'\n')
+def managed_run(args,input=None,timeout=None,**kwargs):
+    # Each command owns a process group so cancellation also stops its descendants.
+    if input is not None:kwargs['stdin']=subprocess.PIPE
+    child=subprocess.Popen([str(a) for a in args],start_new_session=True,**kwargs)
+    try:
+        out,err=child.communicate(input=input,timeout=timeout)
+        return subprocess.CompletedProcess(args,child.returncode,out,err)
+    except BaseException:
+        try:os.killpg(child.pid,signal.SIGTERM)
+        except ProcessLookupError:pass
+        try:child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:os.killpg(child.pid,signal.SIGKILL)
+            except ProcessLookupError:pass
+            child.wait()
+        # A child may exit before its descendants; remove any remaining group members.
+        try:os.killpg(child.pid,signal.SIGKILL)
+        except ProcessLookupError:pass
+        raise
+
 def call(args,timeout=30,input=None,env=None,log=None,allowed=(0,)):
     if log:
         pathlib.Path(log).parent.mkdir(parents=True,exist_ok=True)
         with open(log,'ab') as f:
-            os.chmod(log,0o600);result=subprocess.run([str(a) for a in args],input=input,stdout=f,stderr=f,timeout=timeout,env=env)
-    else:result=subprocess.run([str(a) for a in args],input=input,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,env=env)
+            os.chmod(log,0o600);result=managed_run([str(a) for a in args],input=input,stdout=f,stderr=f,timeout=timeout,env=env)
+    else:result=managed_run([str(a) for a in args],input=input,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,env=env)
     if result.returncode not in allowed:raise Error('命令执行失败：'+str(args[0]).split('/')[-1]+('；日志：'+str(log) if log else '，请检查参数、服务或文件'))
     return result.stdout if not log else b''
 def alpine():return pathlib.Path('/etc/alpine-release').exists()
@@ -2153,7 +2177,7 @@ def commit_config(new,old):
     was=active();backup=ROOT/'backups'/('config-'+str(time.time_ns())+'.json');atomic(backup,old)
     try:
         atomic(CONFIG,data);service('restart');time.sleep(2);sync_now()
-    except Exception:
+    except BaseException as failure:
         atomic(CONFIG,old)
         try:service('restart' if was else 'stop')
         except Exception:say('⚠ 旧配置已恢复，但服务恢复失败，请查看日志。','warn')
@@ -2162,6 +2186,7 @@ def commit_config(new,old):
             if content is None:
                 if path.exists():path.unlink()
             else:atomic(path,content)
+        if isinstance(failure,KeyboardInterrupt):raise failure
         raise Error('修改未完成，已恢复旧配置和旧节点参数。')
     say('✓ 配置已生效，节点信息已更新。','ok')
 
@@ -2283,7 +2308,7 @@ def client_issue(row,renew=False):
             if not sys.stdin.isatty():raise Error('手动 DNS-01 需要交互终端。')
             flag='--yes-I-know-dns-manual-mode-enough-go-ahead-please'
             phase=['--renew','-d',row['domain'],'--ecc','--force',flag] if renew else ['--issue','-d',row['domain'],'--dns','--keylength','ec-256','--accountemail',row['email'],flag]
-            result=subprocess.run([str(a) for a in base+phase],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=900)
+            result=managed_run([str(a) for a in base+phase],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=900)
             output=result.stdout.decode(errors='replace')
             print(output,flush=True)
             challenge='_acme-challenge' in output and 'TXT' in output
@@ -2311,7 +2336,7 @@ def client_issue(row,renew=False):
         say('主机记录通常为 _acme-challenge；完整名称和值以 lego 显示为准。','dim')
         say('等待 DNS 生效后再按回车；验证成功前保留 TXT，Ctrl+C 可取消。','dim')
         args=lego_command(exe,home,row,renew)
-        result=subprocess.run(args,env=env)
+        result=managed_run(args,env=env)
         if result.returncode:raise Error('lego 申请未完成，旧证书与节点配置保持不变；请根据上方错误检查程序参数、网络或 TXT 后重试。')
         filename=row['domain'].replace('*','_')
         return home/'certificates'/(filename+'.crt'),home/'certificates'/(filename+'.key')
@@ -2341,7 +2366,7 @@ def publish_certificate(row,cert,key):
             call([binary(),'check','-c',CONFIG])
             if was:service('restart');time.sleep(2);sync_now()
         db[row['id']]=row;save_registry(db)
-    except Exception:
+    except BaseException as failure:
         if oldtarget is not None:switch_current(current,oldtarget)
         elif current.is_symlink():current.unlink()
         if bound and was:
@@ -2349,6 +2374,7 @@ def publish_certificate(row,cert,key):
             except Exception:say('⚠ 旧证书已恢复，但服务恢复失败。','warn')
         if oldrow:db[row['id']]=oldrow
         else:db.pop(row['id'],None)
+        if isinstance(failure,KeyboardInterrupt):raise failure
         raise Error('证书切换失败，已恢复旧证书。')
     say('✓ 证书已保存：'+row['domain'],'ok');return row
 
@@ -2667,7 +2693,10 @@ def main():
     elif action=='post-install':initialize_sync();service('restart');time.sleep(2);sync_now()
     else:raise Error('未知管理选项。')
 if __name__=='__main__':
+    def stop_requested(signum,frame):raise KeyboardInterrupt()
+    signal.signal(signal.SIGINT,stop_requested);signal.signal(signal.SIGTERM,stop_requested)
     try:main()
+    except KeyboardInterrupt:say('已取消本次操作，申请子进程已清理，管理锁已释放。','warn');sys.exit(130)
     except Cancel:sys.exit(0)
     except Exception as e:say('错误：'+safe_error(e),'error');sys.exit(1)
 ARGO_STANDALONE_PY
