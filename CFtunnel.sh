@@ -1743,6 +1743,24 @@ bbr_enable() {
         printf '  %s默认队列已设置 fq；现有网卡队列未强制替换，不一定立即变化。%s\n' "$C_DIM" "$C_RESET"
     fi
 }
+bbr_current_status() {
+    printf '\n%s  【 当前 BBR 状态 】%s\n' "$C_CYAN" "$C_RESET"; rule
+    bbr_current=$(bbr_read net.ipv4.tcp_congestion_control || true)
+    case "$bbr_current" in
+        bbr) good '当前 TCP 拥塞控制：BBR（已开启）';;
+        '') warn '当前 TCP 拥塞控制：无法读取（无法确认是否开启 BBR）';;
+        *) warn "当前 TCP 拥塞控制：$bbr_current（未使用 BBR）";;
+    esac
+    bbr_queue=$(bbr_read net.core.default_qdisc || true)
+    printf '  默认队列规则：%s%s%s\n' "$C_PURPLE" "${bbr_queue:-此环境无法读取}" "$C_RESET"
+    if [ -s /etc/sysctl.d/99-zz-argo-bbr.conf ] &&
+       grep -Eq '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=[[:space:]]*bbr([[:space:]]|$)' /etc/sysctl.d/99-zz-argo-bbr.conf; then
+        printf '  开机参数：%s已保存%s\n' "$C_GREEN" "$C_RESET"
+    else
+        printf '  开机参数：%s本脚本未保存%s\n' "$C_DIM" "$C_RESET"
+    fi
+}
+
 bbr_menu() {
     while :; do
         bbr_status
@@ -1752,7 +1770,7 @@ bbr_menu() {
         ask '请选择 [0–2]：'
         case "$REPLY" in
             1) run_action bbr_enable;;
-            2) :;;
+            2) bbr_current_status; ask '按回车返回 BBR 菜单：';;
             0) return;;
             *) retry_input '请输入 0、1 或 2。';;
         esac
