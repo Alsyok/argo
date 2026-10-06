@@ -56,7 +56,7 @@ print_prompt_defaults() {
 ask() {
     ask_base_color=$C_CYAN
     case "${1#  }" in
-        '请选择 [0–16]：'|'已有本脚本管理的隧道。替换配置？'*|'本地 WS 端口 '*|'本地 WebSocket 路径 '*) ask_base_color=$C_PROMPT;;
+        '请选择 [0–17]：'|'已有本脚本管理的隧道。替换配置？'*|'本地 WS 端口 '*|'本地 WebSocket 路径 '*) ask_base_color=$C_PROMPT;;
     esac
     case "$1" in
         *'输入 “YES/y” 继续，“NO/n” 取消：'*)
@@ -1777,6 +1777,49 @@ bbr_menu() {
     done
 }
 
+singbox_standalone_install() {
+    case "$1" in
+        debian) standalone_url=https://raw.githubusercontent.com/Alsyok/kyo/main/singbox.sh;;
+        alpine) standalone_url=https://raw.githubusercontent.com/Alsyok/kyo/main/Encrypt.sh;;
+        *) die '未知安装选项。';;
+    esac
+    if ! command -v bash >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        if [ "$MANAGER" = openrc ]; then
+            apk add --no-cache bash curl ca-certificates
+        else
+            apt-get update
+            apt-get install -y bash curl ca-certificates
+        fi
+    fi
+    TMP=$(mktemp -d); chmod 700 "$TMP"
+    printf '\n  %s正在下载 sing-box 安装脚本…%s\n' "$C_CYAN" "$C_RESET"
+    curl -fLsS --retry 2 --connect-timeout 15 --max-time 120 "$standalone_url" -o "$TMP/install.sh" || die '安装脚本下载失败，请稍后重试。'
+    [ -s "$TMP/install.sh" ] || die '下载的安装脚本为空。'
+    bash -n "$TMP/install.sh" || die '安装脚本语法检查失败，未执行。'
+    bash "$TMP/install.sh"
+}
+singbox_standalone_menu() {
+    while :; do
+        printf '\n%s  【 singbox一键安装 】%s\n' "$C_CYAN" "$C_RESET"; rule
+        printf '  系统  %s%s / %s%s\n\n' "$C_WHITE" "$ID" "$MANAGER" "$C_RESET"
+        menu_item "$C_INSTALL" '1.' 'Ubuntu / Debian'
+        menu_item "$C_INSTALL" '2.' 'Alpine'
+        menu_item "$C_DIM" '0.' '返回首页'
+        rule
+        ask '请选择 [0–2]：'
+        case "$REPLY" in
+            1)
+                if [ "$MANAGER" != systemd ]; then retry_input '当前是 Alpine，请选择 2。'; continue; fi
+                run_action singbox_standalone_install debian; return;;
+            2)
+                if [ "$MANAGER" != openrc ]; then retry_input '当前是 Ubuntu / Debian，请选择 1。'; continue; fi
+                run_action singbox_standalone_install alpine; return;;
+            0) return;;
+            *) retry_input '请输入 0、1 或 2。';;
+        esac
+    done
+}
+
 main() {
     detect
     terminal_enter
@@ -1802,11 +1845,13 @@ main() {
         printf '\n%s  【 NETWORK / 网络设置 】%s\n' "$C_CYAN" "$C_RESET"
         menu_item "$C_YELLOW" '15.' '隧道传输（自动 / HTTP2 / QUIC）'
         menu_item "$C_INSTALL" '16.' 'BBR 管理'
+        printf '\n%s  【 singbox一键安装 】%s\n' "$C_CYAN" "$C_RESET"
+        menu_item "$C_INSTALL" '17.' '打开安装菜单'
         menu_item "$C_DIM" '0.' '退出'
         rule
         while :; do
-            ask '  请选择 [0–16]：'
-            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16) break;; *) retry_input '请输入 0–16，重新选择即可。';; esac
+            ask '  请选择 [0–17]：'
+            case "$REPLY" in 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17) break;; *) retry_input '请输入 0–17，重新选择即可。';; esac
         done
         case "$REPLY" in
             1) run_action setup quick;; 2) fixed_menu;; 3) run_action status;;
@@ -1816,7 +1861,7 @@ main() {
             10) if node_exists; then run_action node_control restart; else warn '尚未安装节点。'; fi;;
             11) if node_exists; then run_action node_stop; else warn '尚未安装节点。'; fi;;
             12) run_action node_logs;; 13) run_action update_node;; 14) run_action remove_node;;
-            15) run_action set_transport;; 16) bbr_menu;; 0) exit 0;; *) retry_input '请输入正确选项。';;
+            15) run_action set_transport;; 16) bbr_menu;; 17) singbox_standalone_menu;; 0) exit 0;; *) retry_input '请输入正确选项。';;
         esac
         finish_screen
         clear_screen
