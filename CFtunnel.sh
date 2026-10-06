@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.4.3
+VERSION=2.4.4
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -2266,6 +2266,19 @@ def client_issue(row,renew=False):
             call(base+args,timeout=900,env=env,log=log,allowed=(0,2))
         call(base+['--install-cert','-d',row['domain'],'--ecc','--fullchain-file',export/'fullchain.pem','--key-file',export/'privkey.pem','--reloadcmd','true'],timeout=60,env=env,log=log)
         return export/'fullchain.pem',export/'privkey.pem'
+    if row['method']=='dns-manual':
+        if row['client']!='lego':raise Error('手动 DNS-01 当前使用 lego。')
+        if not sys.stdin.isatty():raise Error('手动 DNS-01 需要交互终端，不能后台自动续签。')
+        exe=install_lego()
+        say('请按下方提示在 DNS 控制台添加 TXT 记录。','warn')
+        say('主机记录通常为 _acme-challenge；完整名称和值以 lego 显示为准。','dim')
+        say('等待 DNS 生效后再按回车；验证成功前保留 TXT，Ctrl+C 可取消。','dim')
+        args=[str(exe),'--path',str(home),'--email',row['email'],'--accept-tos','--domains',row['domain'],'--dns','manual']
+        args+=['renew','--days','3650'] if renew else ['run']
+        result=subprocess.run(args,env=env)
+        if result.returncode:raise Error('手动 DNS 验证失败，旧证书与节点配置保持不变；请检查 TXT 后重试。')
+        filename=row['domain'].replace('*','_')
+        return home/'certificates'/(filename+'.crt'),home/'certificates'/(filename+'.key')
     exe=install_lego();base=[exe,'--path',home,'--email',row['email'],'--accept-tos','--domains',row['domain']]
     base+=['--dns','cloudflare'] if row['method']=='dns' else ['--http','--http.port',':80']
     call(base+(['renew','--days','30'] if renew else ['run']),timeout=900,env=env,log=log)
@@ -2326,11 +2339,14 @@ def issue_certificate(host=None,selfsigned=False):
             return publish_certificate(row,cert,key)
     existing=next((r for r in registry().values() if r['domain']==host and r['kind']=='formal'),None)
     if existing and not confirm('已有该域名证书，重新检查/申请并替换它的管理方式？'):return existing
-    method=choose('验证方式：1 Cloudflare DNS / 2 HTTP（公网 80）',('1','2'),'1');method='dns' if method=='1' else 'http'
+    method=choose('验证方式：1 Cloudflare DNS API / 2 HTTP（公网 80） / 3 手动 DNS-01（无 API）',('1','2','3'),'1');method={'1':'dns','2':'http','3':'dns-manual'}[method]
     auth=cf_credentials(host) if method=='dns' else None
     email=prompt('ACME 联系邮箱')
     if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise Error('请输入有效邮箱。')
-    client=choose('申请程序：1 acme.sh（主用）/ 2 lego（备用）',('1','2'),'1');client='acme.sh' if client=='1' else 'lego'
+    if method=='dns-manual':
+        client='lego';say('手动 DNS-01 使用 lego；后续续签也需人工添加 TXT。','warn')
+    else:
+        client=choose('申请程序：1 acme.sh（主用）/ 2 lego（备用）',('1','2'),'1');client='acme.sh' if client=='1' else 'lego'
     row={'id':existing['id'] if existing else hashlib.sha256(('formal:'+host).encode()).hexdigest()[:20],'domain':host,'kind':'formal','client':client,'method':method,'email':email}
     row['client_home']=str(ROOT/'clients'/row['id']/('attempt-'+str(time.time_ns())+'-'+client))
     if auth is not None:
@@ -2338,12 +2354,16 @@ def issue_certificate(host=None,selfsigned=False):
         write(authfile,auth);row['auth_file']=str(authfile)
     try:cert,key=client_issue(row)
     except Exception as e:
+        if method=='dns-manual':raise
         say(str(e),'warn')
         if not confirm('本次申请失败，改用备用程序申请？'):raise Cancel()
         row['client']='lego' if client=='acme.sh' else 'acme.sh'
         row['client_home']=str(ROOT/'clients'/row['id']/('attempt-'+str(time.time_ns())+'-'+row['client']))
         cert,key=client_issue(row)
-    result=publish_certificate(row,cert,key);schedule_renew();say('✓ 已启用每日续签检查。','ok');return result
+    result=publish_certificate(row,cert,key)
+    if method=='dns-manual':say('✓ 手动 DNS 证书已保存；到期前请进入“续签证书”并按提示更新 TXT。','ok')
+    else:schedule_renew();say('✓ 已启用每日续签检查。','ok')
+    return result
 
 def list_certificates(select=False,host=None):
     rows=list(registry().items())
@@ -2366,7 +2386,7 @@ def list_certificates(select=False,host=None):
                 try:check_certificate(row['cert'],row['key'],host,trust=row['kind']=='formal')
                 except Exception:continue
             valid.append((rid,row));item(len(valid),', '.join(san)+' · '+('自签' if row['kind']=='self' else '正式')+' · '+expires)
-            say('证书：'+row['cert'],'dim');say('私钥路径：'+row['key'],'dim');say('续签程序：'+row['client'],'dim')
+            say('证书：'+row['cert'],'dim');say('私钥路径：'+row['key'],'dim');say('续签程序：'+row['client']+('（手动 DNS，需人工更新 TXT）' if row.get('method')=='dns-manual' else ''),'dim')
         except Exception:say('⚠ 无法读取证书：'+row['cert'],'warn')
     if not valid:say('暂无可用证书。','warn');return None
     if select:
@@ -2398,6 +2418,10 @@ def renew_due():
     failures=0
     for row in registry().values():
         if row['kind']!='formal' or row['method']=='external':continue
+        if row['method']=='dns-manual':
+            try:check_certificate(row['cert'],row['key'],row['domain'],seconds=30*86400,trust=True)
+            except Exception:say('需要人工续签：'+row['domain']+'；请进入 18 → 续签证书更新 TXT。','warn')
+            continue
         try:check_certificate(row['cert'],row['key'],row['domain'],seconds=30*86400,trust=True);continue
         except Exception:pass
         try:cert,key=client_issue(row,True);publish_certificate(row,cert,key)
