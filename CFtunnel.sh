@@ -1,7 +1,7 @@
 #!/bin/sh
 # Cloudflare Tunnel manager: Alpine/OpenRC and Debian/systemd
 set -eu
-VERSION=2.4.6
+VERSION=2.4.8
 BASE=/etc/vps-tunnel
 BIN=/usr/local/lib/vps-tunnel/cloudflared
 SERVICE=vps-tunnel
@@ -1810,7 +1810,7 @@ standalone_tools() {
     cat > "$standalone_helper_tmp" <<'ARGO_STANDALONE_PY'
 #!/usr/bin/env python3
 """Independent sing-box and certificate management; never manages vps-node."""
-import signal,textwrap,contextlib,functools,base64,copy,datetime,fcntl,getpass,hashlib,importlib.util,ipaddress,json,os,pathlib,re,secrets,shutil,socket,ssl,subprocess,sys,tarfile,tempfile,time,urllib.parse,urllib.request,uuid
+import threading,signal,textwrap,contextlib,functools,base64,copy,datetime,fcntl,getpass,hashlib,importlib.util,ipaddress,json,os,pathlib,re,secrets,shutil,socket,ssl,subprocess,sys,tarfile,tempfile,time,urllib.parse,urllib.request,uuid
 ROOT=pathlib.Path('/etc/argo-certificates')
 LIB=pathlib.Path('/usr/local/lib/argo-standalone')
 CONFIG=pathlib.Path('/etc/sing-box/config.json')
@@ -1881,12 +1881,29 @@ def locked(func):
     return wrapper
 def read(path):return json.loads(pathlib.Path(path).read_text())
 def write(path,obj):atomic(path,json.dumps(obj,ensure_ascii=False,indent=2)+'\n')
-def managed_run(args,input=None,timeout=None,**kwargs):
+def managed_run(args,input=None,timeout=None,stream_log=None,**kwargs):
     # Each command owns a process group so cancellation also stops its descendants.
     if input is not None:kwargs['stdin']=subprocess.PIPE
+    if stream_log is not None:kwargs.update(stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
     child=subprocess.Popen([str(a) for a in args],start_new_session=True,**kwargs)
+    reader=None
+    if stream_log is not None:
+        def forward():
+            env=kwargs.get('env') or {}
+            private=[str(v) for k,v in env.items() if v and any(word in k.upper() for word in ('TOKEN','SECRET','PASSWORD','CF_KEY','API_KEY'))]
+            for raw in iter(child.stdout.readline,b''):
+                text=raw.decode(errors='replace')
+                for value in private:text=text.replace(value,'[已隐藏]')
+                stream_log.write(text.encode());stream_log.flush()
+                try:sys.stdout.write(text);sys.stdout.flush()
+                except (BrokenPipeError,OSError):pass
+        reader=threading.Thread(target=forward,daemon=True);reader.start()
     try:
-        out,err=child.communicate(input=input,timeout=timeout)
+        if reader is not None:
+            if input is not None:
+                child.stdin.write(input);child.stdin.close()
+            child.wait(timeout=timeout);reader.join(timeout=3);out=err=None
+        else:out,err=child.communicate(input=input,timeout=timeout)
         return subprocess.CompletedProcess(args,child.returncode,out,err)
     except BaseException:
         try:os.killpg(child.pid,signal.SIGTERM)
@@ -1899,13 +1916,16 @@ def managed_run(args,input=None,timeout=None,**kwargs):
         # A child may exit before its descendants; remove any remaining group members.
         try:os.killpg(child.pid,signal.SIGKILL)
         except ProcessLookupError:pass
+        if reader is not None:reader.join(timeout=3)
         raise
 
 def call(args,timeout=30,input=None,env=None,log=None,allowed=(0,)):
     if log:
         pathlib.Path(log).parent.mkdir(parents=True,exist_ok=True)
         with open(log,'ab') as f:
-            os.chmod(log,0o600);result=managed_run([str(a) for a in args],input=input,stdout=f,stderr=f,timeout=timeout,env=env)
+            os.chmod(log,0o600)
+            if sys.stdin.isatty():result=managed_run(args,input=input,timeout=timeout,env=env,stream_log=f)
+            else:result=managed_run(args,input=input,stdout=f,stderr=f,timeout=timeout,env=env)
     else:result=managed_run([str(a) for a in args],input=input,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,env=env)
     if result.returncode not in allowed:raise Error('命令执行失败：'+str(args[0]).split('/')[-1]+('；日志：'+str(log) if log else '，请检查参数、服务或文件'))
     return result.stdout if not log else b''
@@ -2376,7 +2396,15 @@ def publish_certificate(row,cert,key):
         else:db.pop(row['id'],None)
         if isinstance(failure,KeyboardInterrupt):raise failure
         raise Error('证书切换失败，已恢复旧证书。')
-    say('✓ 证书已保存：'+row['domain'],'ok');return row
+    say('✓ 证书已保存：'+row['domain'],'ok')
+    if sys.stdin.isatty():
+        title('签发完成 · 证书信息')
+        try:
+            details=call(['openssl','x509','-in',row['cert'],'-noout','-subject','-issuer','-dates','-ext','subjectAltName']).decode(errors='replace')
+            print(details,flush=True);say('证书路径：'+row['cert'],'dim');say('私钥路径：'+row['key']+'（不显示私钥内容）','dim')
+            title('完整证书 PEM（含证书链）');print(pathlib.Path(row['cert']).read_text(),flush=True)
+        except Exception:say('证书已保存，详情展示失败；可通过“查看已有证书”查看。','warn')
+    return row
 
 def schedule_renew():
     if alpine():
@@ -2571,7 +2599,7 @@ def group_input(label,values,validate=lambda v:v,generate=None,secret=False):
         except (Error,ValueError):say('↻ 输入格式无效，请重新输入。','retry')
 
 def edit_node(kind):
-    cfg=config();old=CONFIG.read_bytes();indices=select_inbounds(cfg,kind);new=copy.deepcopy(cfg);targets=[new['inbounds'][i] for i in indices]
+    cfg=config();old=CONFIG.read_bytes();indices=select_inbounds(cfg,kind);new=copy.deepcopy(cfg);targets=[new['inbounds'][i] for i in indices];display_indices=list(indices)
     title('修改 '+{'reality':'VLESS-Reality','tls':'VLESS-TLS','hy2':'Hysteria2'}[kind])
     for i in indices:
         current=cfg['inbounds'][i];family=ipaddress.ip_address(current.get('listen','::')).version
@@ -2639,6 +2667,8 @@ def edit_node(kind):
             shared=[t for j,t in enumerate(new['inbounds']) if j not in indices and
                     (t.get('tls',{}).get('certificate_path'),t.get('tls',{}).get('key_path')) in oldpairs and not t.get('tls',{}).get('reality',{}).get('enabled')]
             allshared=bool(shared) and choose('当前证书被其它节点共用：1 一起更换 / 2 仅所选节点',('1','2'),'2')=='1'
+            if allshared:
+                display_indices+= [j for j,t in enumerate(new['inbounds']) if j not in display_indices and any(t is other for other in shared)]
             for target in targets+(shared if allshared else []):target['tls'].update(server_name=row['domain'],certificate_path=row['cert'],key_path=row['key'])
         for target in targets:
             tls=target['tls'];check_certificate(tls['certificate_path'],tls['key_path'],tls['server_name'],trust=cert_kind(tls['certificate_path'])=='formal')
@@ -2646,7 +2676,7 @@ def edit_node(kind):
     initialize_sync();commit_config(new,old)
     try:
         title('刚修改的节点链接 · 可直接复制')
-        print(color('link',generate_links(new,json.loads(META.read_text()),indices)),flush=True)
+        print(color('link',generate_links(new,json.loads(META.read_text()),display_indices)),flush=True)
         say('每条链接单独一行；复制到 v2rayN，从剪贴板导入。','dim')
     except Exception:
         say('配置已生效；链接展示失败，可到“查看节点信息”读取已保存链接。','warn')
