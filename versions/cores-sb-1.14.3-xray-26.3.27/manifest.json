@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "distribution": "github-raw",
+  "repository": "Alsyok/argo",
+  "release_tag": "cores-sb-1.14.3-xray-26.3.27",
+  "synced_at": "2026-10-10T04:36:11.261561+00:00",
+  "cores": {
+    "sing-box": {
+      "version": "v1.14.3",
+      "upstream_repository": "SagerNet/sing-box",
+      "upstream_release": "https://github.com/SagerNet/sing-box/releases/tag/v1.14.3",
+      "assets": {
+        "amd64": {
+          "filename": "sing-box-linux-amd64.tar.gz",
+          "sha256": "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee",
+          "size": 31678266,
+          "upstream_asset": "sing-box-1.14.3-linux-amd64.tar.gz",
+          "download_url": "https://raw.githubusercontent.com/Alsyok/argo/cores/versions/cores-sb-1.14.3-xray-26.3.27/sing-box-linux-amd64.tar.gz"
+        },
+        "arm64": {
+          "filename": "sing-box-linux-arm64.tar.gz",
+          "sha256": "29dae24d76bea3bc62d07dd3e60cfc12003de7debbd6b768df9be9c68360174e",
+          "size": 29110944,
+          "upstream_asset": "sing-box-1.14.3-linux-arm64.tar.gz",
+          "download_url": "https://raw.githubusercontent.com/Alsyok/argo/cores/versions/cores-sb-1.14.3-xray-26.3.27/sing-box-linux-arm64.tar.gz"
+        }
+      }
+    },
+    "xray": {
+      "version": "v26.3.27",
+      "upstream_repository": "XTLS/Xray-core",
+      "upstream_release": "https://github.com/XTLS/Xray-core/releases/tag/v26.3.27",
+      "assets": {
+        "amd64": {
+          "filename": "xray-linux-amd64.zip",
+          "sha256": "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae",
+          "size": 21136402,
+          "upstream_asset": "Xray-linux-64.zip",
+          "download_url": "https://raw.githubusercontent.com/Alsyok/argo/cores/versions/cores-sb-1.14.3-xray-26.3.27/xray-linux-amd64.zip"
+        },
+        "arm64": {
+          "filename": "xray-linux-arm64.zip",
+          "sha256": "4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c",
+          "size": 19716427,
+          "upstream_asset": "Xray-linux-arm64-v8a.zip",
+          "download_url": "https://raw.githubusercontent.com/Alsyok/argo/cores/versions/cores-sb-1.14.3-xray-26.3.27/xray-linux-arm64.zip"
+        }
+      }
+    }
+  }
+}
