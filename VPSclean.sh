@@ -1,7 +1,7 @@
 #!/bin/sh
 # VPS cleanup utility. Does not format disks or restore an OS baseline.
 set -eu
-VERSION=1.1.0
+VERSION=1.2.0
 RESET= CYAN= GREEN= YELLOW= RED=
 if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
     RESET=$(printf '\033[0m'); CYAN=$(printf '\033[1;36m')
@@ -122,7 +122,7 @@ package_installed() {
 choose_software() {
     note '选择软件包卸载。支持以下常见应用；SSH、网络和系统包不在可选范围。'
     count=0; choices=
-    for pkg in sing-box singbox xray cloudflared nginx apache2 mariadb-server mysql-server postgresql redis redis-server docker docker.io containerd; do
+    for pkg in sing-box singbox xray cloudflared caddy certbot lego nginx apache2 mariadb-server mysql-server postgresql redis redis-server docker docker.io containerd; do
         if package_installed "$pkg"; then
             count=$((count + 1)); choices="$choices $pkg"
             printf '  %s. %s\n' "$count" "$pkg"
@@ -206,8 +206,163 @@ clean_home() {
         rm -rf "$item"
     done
 }
+
+# Explicit application scope. Never remove /etc/ssl/certs or system trust roots.
+EXTRA_PATHS='/etc/nodes /etc/argo-certificates /etc/subscription-api /opt/subscription-api /etc/nginx /etc/caddy /etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt /etc/ssl/sing-box /etc/nginx/ssl /root/.acme.sh /root/.lego /etc/lego /var/lib/lego /root/cert /root/certs /usr/local/lib/argo-standalone /usr/local/lib/argo-node-files /usr/local/lib/singbox-node-sync /usr/local/lib/alpine-node-sync /usr/local/lib/xray-node-sync /var/lib/singbox-node-sync /var/lib/xray-node-sync /run/singbox-node-sync /run/xray-node-sync /var/log/vps-tunnel /var/log/nginx /var/log/caddy /var/lib/caddy /var/lib/subscription-api'
+EXTRA_SERVICES='alpine-node-sync argo-sb-sync singbox-node-sync xray-node-sync subscription-cert-sync argo-cert-renew vpskit-xray subscription-api caddy nginx certbot'
+OWN_CRON='acme\.sh|certbot|/root/\.lego|argo-cert|argo-standalone|argo-node-files|singbox-node-sync|alpine-node-sync|xray-node-sync|subscription-cert-sync|vps-tunnel|vps-node'
+extra_preview() {
+    note '还将清理：标准节点同步、订阅、应用证书、续签任务、Caddy/Nginx。'
+    for path in $EXTRA_PATHS; do
+        if [ -e "$path" ] || [ -L "$path" ]; then printf '  删除：%s\n' "$path"; fi
+    done
+    note '同时卸载已安装的软件包：caddy nginx nginx-common apache2 certbot python3-certbot lego（不自动卸载其他依赖）。'
+    note '系统信任证书 /etc/ssl/certs、SSH 主机密钥和网络组件保留。'
+    note '第三方软件源需通过菜单 9 单独检查并禁用；未知程序、自定义证书路径不自动删除。'
+}
+remove_extra_packages() {
+    for pkg in caddy nginx nginx-common apache2 certbot python3-certbot lego; do
+        package_installed "$pkg" || continue
+        if [ "$MANAGER" = systemd ]; then
+            plan=$(apt-get -s purge "$pkg") || return 1
+            affected=$(printf '%s\n' "$plan" | awk '/^(Remv|Purg) / {print $2}')
+            for dep in $affected; do
+                case "$dep" in caddy|nginx|nginx-common|nginx-core|nginx-full|nginx-light|apache2|apache2-bin|apache2-data|apache2-utils|certbot|python3-certbot|python3-certbot-*|lego|libnginx-mod-*) :;;
+                    *) die "卸载 $pkg 将影响范围外软件 $dep，停止；已完成的清理不恢复。";;
+                esac
+            done
+            apt-get purge -y "$pkg"
+        else apk del --no-scripts "$pkg"; fi
+    done
+}
+extra_cleanup() {
+    # Stop periodic triggers before deleting core configuration or certificates.
+    for svc in $EXTRA_SERVICES; do
+        if [ "$MANAGER" = systemd ] && systemctl cat "$svc.timer" >/dev/null 2>&1; then
+            systemctl stop "$svc.timer"; systemctl disable "$svc.timer" >/dev/null 2>&1 || true
+        fi
+        stop_service "$svc"
+    done
+    for file in /etc/crontabs/* /var/spool/cron/crontabs/*; do
+        [ -f "$file" ] || continue
+        [ ! -L "$file" ] || die "定时任务文件 $file 是链接，请人工检查。"
+        tmp=$(mktemp)
+        awk -v pattern="$OWN_CRON" '$0 !~ pattern' "$file" > "$tmp"
+        cat "$tmp" > "$file"; rm -f "$tmp"
+    done
+    for file in /etc/cron.d/*; do
+        [ -f "$file" ] || continue
+        case "${file##*/}" in certbot|argo-cert-renew|subscription-cert-sync|singbox-node-sync|alpine-node-sync|xray-node-sync) rm -f "$file";; esac
+    done
+    # Also stop manually launched standard web servers; unknown names are not targeted.
+    if command -v pgrep >/dev/null 2>&1; then
+        for program in caddy nginx; do
+            pids=$(pgrep -x "$program" || true)
+            [ -z "$pids" ] || kill -TERM $pids
+        done
+    fi
+    remove_extra_packages
+    for svc in $EXTRA_SERVICES; do
+        rm -f "/etc/init.d/$svc" "/etc/conf.d/$svc" "/etc/systemd/system/$svc.service" "/etc/systemd/system/$svc.timer"
+    done
+    for svc in $EXTRA_SERVICES; do rm -rf "/etc/systemd/system/$svc.service.d" "/etc/systemd/system/$svc.timer.d"; done
+    for path in $EXTRA_PATHS; do rm -rf "$path"; done
+    rm -f /usr/local/bin/caddy /usr/local/bin/lego /usr/local/bin/certbot /usr/local/bin/xray-info /root/singbox_nodes.txt
+    if [ "$MANAGER" = systemd ]; then systemctl daemon-reload; fi
+}
+verify_cleanup() {
+    note '清理后核验（仍有输出不一定是故障，请检查未知安装）：'
+    if command -v ss >/dev/null 2>&1; then ss -lntup; fi
+    for name in caddy nginx sing-box xray cloudflared; do
+        if command -v pgrep >/dev/null 2>&1; then pgrep -a -x "$name" || true; fi
+    done
+    for path in $EXTRA_PATHS; do [ ! -e "$path" ] || printf '  残留：%s\n' "$path"; done
+    note '系统、账号、SSH、网络仍保留。APT 源检查请选 9；自定义进程和路径需人工核对。'
+}
+caddy_cleanup() {
+    note '停止 Caddy，卸载标准软件包和 /usr/local/bin/caddy，并删除 /etc/caddy、/var/lib/caddy、/var/log/caddy。'
+    for path in /etc/caddy /var/lib/caddy /var/log/caddy; do [ ! -e "$path" ] || safe_tree "$path"; done
+    ask '确认删除 Caddy 及其证书和配置？YES/y：'; yes || return 0
+    stop_service caddy
+    if package_installed caddy; then
+        if [ "$MANAGER" = systemd ]; then
+            plan=$(apt-get -s purge caddy) || return 1
+            for dep in $(printf '%s\n' "$plan" | awk '/^(Remv|Purg) / {print $2}'); do [ "$dep" = caddy ] || die "将影响 $dep，取消。"; done
+            apt-get purge -y caddy
+        else apk del --no-scripts caddy; fi
+    fi
+    rm -rf /etc/caddy /var/lib/caddy /var/log/caddy
+    rm -f /usr/local/bin/caddy /etc/init.d/caddy /etc/conf.d/caddy /etc/systemd/system/caddy.service
+    if [ "$MANAGER" = systemd ]; then systemctl daemon-reload; fi
+    note 'Caddy 已处理；软件源独立，请选 9 检查。'
+}
+
+protected_package() {
+    case "$1" in
+        openssh*|ssh|ssh-*|sudo|bash|dash|busybox*|coreutils|libc*|musl*|apk-tools*|apt|apt-*|dpkg*|systemd*|openrc*|linux-*|grub*|init*|network*|netplan*|ifupdown*|iproute*|dhcpcd*|cloud-init*|ca-certificates*|ubuntu-minimal|ubuntu-standard|debian-archive-keyring|ubuntu-keyring) return 0;;
+    esac
+    if [ "$MANAGER" = systemd ]; then
+        flags=$(dpkg-query -W -f='${Essential} ${Priority}' "$1" 2>/dev/null || true)
+        case "$flags" in yes*|*required*|*important*) return 0;; esac
+    fi
+    return 1
+}
+other_package_cleanup() {
+    note '通用卸载：不区分安装者，适用于包管理器安装的其他应用。'
+    note '只接受软件包名称；SSH、网络、内核、系统基础包及其连带删除会被拒绝。'
+    inventory
+    ask '输入要卸载的软件包名，0 返回：'
+    case "$REPLY" in 0|'') return;; -*|*[!A-Za-z0-9+._:-]*) note '软件包名无效。'; return;; esac
+    selected=$REPLY
+    package_installed "$selected" || { note '没有此已安装软件包；手动二进制不能用包管理器卸载。'; return; }
+    protected_package "$selected" && { note '系统基础包受保护，不能卸载。'; return; }
+    if [ "$MANAGER" = systemd ]; then
+        plan=$(apt-get -s purge "$selected") || return 1
+        printf '%s\n' "$plan"
+        affected=$(printf '%s\n' "$plan" | awk '/^(Remv|Purg) / {print $2}')
+        for dep in $affected; do
+            protected_package "$dep" && { note "计划会删除受保护软件 $dep，已取消。"; return; }
+        done
+    else
+        # An unknown Alpine package may remove reverse dependencies too; leave this to apk explicitly.
+        apk del --simulate "$selected"
+        note 'Alpine 通用卸载只预览；未知依赖无法可靠判断，未执行删除。'
+        return
+    fi
+    ask '按上面完整计划卸载并 purge？YES/y：'; yes || return 0
+    apt-get purge -y "$selected"
+    note '软件包及其管理的配置已处理；用户数据、手动文件和软件源不保证删除。'
+}
+
+source_menu() {
+    [ "$MANAGER" = systemd ] || { note '此功能只管理 Debian/Ubuntu APT 源。'; return; }
+    note '先检查全部 APT 源；402、404、超时、签名错误会由 APT 原样显示，不自动判定或删除。'
+    apt-get update || note '有源检查失败；短暂网络故障也可能导致失败。'
+    note '可选第三方源文件（单文件可能有多个源，将禁用整个文件；官方或混合官方源不列出）：'
+    choices=; count=0
+    for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "$file" ] || continue
+        if grep -Eq '([A-Za-z0-9.-]+\.)?(ubuntu\.com|debian\.org|alpinelinux\.org)(/|[ :])' "$file"; then continue; fi
+        count=$((count+1)); choices="$choices $file"; printf '  %s. %s\n' "$count" "$file"
+    done
+    [ "$count" -gt 0 ] || { note '没有可选文件；自定义镜像或主 sources.list 请人工核对。'; return; }
+    ask '输入编号查看并禁用，0 返回：'
+    case "$REPLY" in 0|'') return;; *[!0-9]*) note '编号无效。'; return;; esac
+    index=0; selected=
+    for file in $choices; do index=$((index+1)); if [ "$REPLY" = "$index" ]; then selected=$file; fi; done
+    [ -n "$selected" ] || { note '编号无效。'; return; }
+    cat "$selected"
+    note '上面全部条目会暂停更新；不卸载已安装软件。若是系统镜像，请取消。'
+    ask '确认禁用整个文件？YES/y：'; yes || return 0
+    [ ! -e "$selected.vpsclean-disabled" ] || die '已有禁用备份，请先处理。'
+    mv "$selected" "$selected.vpsclean-disabled"
+    note "已禁用；恢复命令：mv '$selected.vpsclean-disabled' '$selected'"
+    apt-get update || note '仍有软件源错误，请继续核对。'
+}
+
 deep_cleanup() {
     preview_data
+    extra_preview
     note '数据无法通过本脚本恢复。请先自行备份。'
     ask '输入 CLEAN-DATA 确认执行预览范围的数据删除：'
     [ "$REPLY" = CLEAN-DATA ] || { note '已取消。'; return 0; }
@@ -230,6 +385,10 @@ deep_cleanup() {
         safe_tree "$home_path"
         [ ! -L "$home_path/.ssh" ] || die "$home_path/.ssh 是链接，取消清理。"
     done
+    for path in $EXTRA_PATHS; do
+        if [ -e "$path" ] || [ -L "$path" ]; then safe_tree "$path"; fi
+    done
+    extra_cleanup
     # Keep this running script out of the cleanup scope until the operation completes.
     for svc in nginx apache2 httpd mariadb mysql postgresql redis redis-server docker containerd; do stop_service "$svc"; done
     remove_nodes
@@ -238,7 +397,8 @@ deep_cleanup() {
         [ ! -e "$path" ] || rm -rf "$path"
     done
     if [ "$MANAGER" = systemd ]; then apt-get clean; fi
-    note '已清理预览范围。未重装系统，未删除 SSH、网络、账号及系统基础组件。'
+    verify_cleanup
+    note '已完成列出的深度清理；未重装系统，未知程序可能仍有残留。'
 }
 inventory() {
     if [ "$MANAGER" = openrc ]; then apk info; rc-status -a
@@ -263,10 +423,13 @@ main() {
         note '4. 卸载本项目的隧道和节点'
         note '5. 检查其他脚本安装的 sing-box / Xray'
         note '6. 选择软件并卸载、清理残留'
-        printf '  %s7. 深度清理用户数据（预览后确认）%s\n' "$RED" "$RESET"
+        printf '  %s7. 深度清理应用、节点、证书和用户数据%s\n' "$RED" "$RESET"
+        note '8. 卸载 Caddy（含配置和证书）'
+        note '9. 检查 APT 软件源并选择禁用'
+        note '10. 卸载其他软件包（Debian/Ubuntu；Alpine 仅预览）'
         note '0. 退出'
-        ask '请选择 [0–7]：'
-        case "$REPLY" in 1) action inventory;; 2) action cache_cleanup;; 3) action old_logs;; 4) action project_cleanup;; 5) action other_nodes;; 6) action choose_software;; 7) action deep_cleanup;; 0) exit 0;; *) note '请输入正确选项。';; esac
+        ask '请选择 [0–10]：'
+        case "$REPLY" in 1) action inventory;; 2) action cache_cleanup;; 3) action old_logs;; 4) action project_cleanup;; 5) action other_nodes;; 6) action choose_software;; 7) action deep_cleanup;; 8) action caddy_cleanup;; 9) action source_menu;; 10) action other_package_cleanup;; 0) exit 0;; *) note '请输入正确选项。';; esac
     done
 }
 main "$@"
